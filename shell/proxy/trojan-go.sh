@@ -76,7 +76,6 @@ done
 
 # --- 依赖安装 ---
 function install_dependencies() {
-    # (与 v1.5 版本相同)
     print_info "更新软件包列表并安装依赖项 (curl, wget, unzip, socat, jq, coreutils)..."
     local pkg_manager=""; local pkgs_core="curl wget unzip socat jq coreutils"; local pkgs_needed=()
     if command -v apt-get &>/dev/null; then pkg_manager="apt"; elif command -v yum &>/dev/null; then pkg_manager="yum"; elif command -v dnf &>/dev/null; then pkg_manager="dnf"; fi
@@ -148,7 +147,6 @@ function get_user_input_values() {
 
 # --- 安装 acme.sh ---
 function install_acme() {
-    # (与 v1.5 版本相同)
     print_info "检查并安装/更新 acme.sh..."; ACME_CMD="$HOME/.acme.sh/acme.sh"
     if [ -f "$ACME_CMD" ]; then print_ok "acme.sh 已安装。"; print_info "尝试更新 acme.sh..."; "$ACME_CMD" --upgrade --log-level 1 || print_warning "更新 acme.sh 失败。";
     else print_info "正在安装 acme.sh..."; curl https://get.acme.sh | sh -s email="$ACME_EMAIL" || { print_error "安装 acme.sh 失败。"; exit 1; }; if [ ! -f "$ACME_CMD" ]; then print_error "安装后未找到 acme.sh。"; exit 1; fi; print_ok "acme.sh 安装成功。"; "$ACME_CMD" --upgrade --auto-upgrade || print_warning "启用自动更新失败。"; fi
@@ -216,7 +214,6 @@ function issue_certificate() {
 
 # --- 安装 Trojan-Go ---
 function install_trojan_go() {
-    # (与 v1.5 版本相同)
     print_info "正在安装 Trojan-Go..."; ARCH=$(uname -m); TROJAN_GO_ARCH=""; case $ARCH in x86_64) TROJAN_GO_ARCH="amd64" ;; aarch64) TROJAN_GO_ARCH="arm64" ;; armv7l) TROJAN_GO_ARCH="armv7" ;; *) print_error "不支持架构: ${ARCH}"; exit 1 ;; esac; print_info "检测到架构: ${TROJAN_GO_ARCH}"
     print_info "获取 Trojan-Go 版本..."; LATEST_TAG=$(curl -sI "https://github.com/p4gefau1t/trojan-go/releases/latest" | grep -i "location:" | awk -F'/' '{print $NF}' | tr -d '\r'); if [[ -z "$LATEST_TAG" ]] || [[ ! "$LATEST_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then print_warning "无法获取或格式错误 ('${LATEST_TAG}')。使用 v0.10.6。"; LATEST_TAG="v0.10.6"; else print_info "最新版本: ${LATEST_TAG}"; fi
     DOWNLOAD_URL="https://github.com/p4gefau1t/trojan-go/releases/download/${LATEST_TAG}/trojan-go-linux-${TROJAN_GO_ARCH}.zip"; DOWNLOAD_FILE="/tmp/trojan-go.zip"
@@ -229,7 +226,6 @@ function install_trojan_go() {
 
 # --- 配置 Trojan-Go ---
 function configure_trojan_go() {
-    # (与 v1.5 版本相同)
     print_info "生成 Trojan-Go 配置文件..."; CONFIG_FILE="${TROJAN_GO_CONFIG_DIR}/config.json"
     jq -n --arg run_type "server" --arg local_addr "0.0.0.0" --argjson local_port "${TROJAN_PORT}" \
       --arg remote_addr "127.0.0.1" --argjson remote_port 80 --arg password "${TROJAN_PASSWORD}" \
@@ -243,7 +239,6 @@ function configure_trojan_go() {
 
 # --- 配置 Nginx 回落 ---
 function setup_fallback_webserver() {
-    # (与 v1.5 版本相同)
     print_info "检查并配置 HTTP (80端口) 回落服务 (使用 Nginx)..."; local nginx_installed=false; local port_80_listening=false; local nginx_listening_80=false
     if command -v nginx &>/dev/null; then nginx_installed=true; fi; if sudo ss -Hltn 'sport = 80' | grep -q 'LISTEN'; then port_80_listening=true; if sudo ss -Hltnp 'sport = 80' | grep -q 'nginx'; then nginx_listening_80=true; fi; fi
     if ! $port_80_listening; then
@@ -279,7 +274,6 @@ EOF
 
 # --- 设置 Systemd 服务 ---
 function setup_systemd_service() {
-    # (与 v1.5 版本相同)
     print_info "设置 Trojan-Go systemd 服务..."; cat > "$TROJAN_GO_SERVICE_FILE" <<-EOF
 [Unit]
 Description=Trojan-Go Service (Port ${TROJAN_PORT})
@@ -303,7 +297,6 @@ EOF
 
 # --- 配置防火墙 ---
 function configure_firewall() {
-    # (与 v1.5 版本相同)
     print_info "配置防火墙允许端口 ${TROJAN_PORT}/tcp 和 80/tcp..."; local ports_to_open=("${TROJAN_PORT}/tcp" "80/tcp"); local fw_cmd=""; if command -v ufw &>/dev/null; then fw_cmd="ufw"; elif command -v firewall-cmd &>/dev/null; then fw_cmd="firewall-cmd"; fi
     if [ "$fw_cmd" = "ufw" ]; then print_info "检测到 UFW..."; local ufw_reload=false; for port_rule in "${ports_to_open[@]}"; do if ! sudo ufw status | grep -qw "$port_rule"; then print_info "允许 UFW: ${port_rule}..."; sudo ufw allow ${port_rule} || print_warning "添加 UFW (${port_rule}) 失败。"; ufw_reload=true; else print_info "UFW 规则 ${port_rule} 已存在。"; fi; done; if $ufw_reload; then sudo ufw reload || print_warning "重载 UFW 失败。"; fi
     elif [ "$fw_cmd" = "firewall-cmd" ]; then print_info "检测到 Firewalld..."; local fw_reload=false; for port_rule in "${ports_to_open[@]}"; do if ! sudo firewall-cmd --list-ports --permanent | grep -qw "$port_rule"; then print_info "允许 Firewalld: ${port_rule}..."; sudo firewall-cmd --permanent --add-port=${port_rule} || print_warning "添加 Firewalld (${port_rule}) 失败。"; fw_reload=true; else print_info "Firewalld 规则 ${port_rule} 已存在。"; fi; done; if $fw_reload; then sudo firewall-cmd --reload || print_warning "重载 Firewalld 失败。"; fi
@@ -312,7 +305,6 @@ function configure_firewall() {
 
 # --- 显示总结信息 ---
 function display_summary() {
-    # (与 v1.5 版本相同)
     print_info "-------------------- 安装完成 --------------------"; print_ok "Trojan-Go 及 Nginx 回落配置已完成！"; print_info "--------------------------------------------------"
     print_info "Trojan-Go 服务器连接信息:"; echo -e "  ${YELLOW}地址:${NC} ${DOMAIN}"; echo -e "  ${YELLOW}端口:${NC} ${TROJAN_PORT}"; echo -e "  ${YELLOW}密码:${NC} ${TROJAN_PASSWORD}"; echo -e "  ${YELLOW}SNI:${NC}  ${DOMAIN}"
     print_info "--------------------------------------------------"; print_info "HTTP 回落 (端口 80):"; echo -e "  访问 http://${DOMAIN} 时将根据配置响应。"; echo -e "  Nginx 配置文件: ${NGINX_CONFIG_FILE}"
