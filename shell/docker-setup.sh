@@ -43,6 +43,14 @@ fi
 
 # 测试 Docker 是否正常工作
 echo "正在运行测试容器..."
-docker run hello-world
+docker run --name hello-world-test hello-world
 
-echo "Docker 安装和配置完成！"
+# 删除测试容器
+echo "正在删除测试容器..."
+docker rm hello-world-test
+
+# 删除 hello-world 镜像
+echo "正在删除 hello-world 镜像..."
+docker rmi hello-world
+
+echo "Docker 安装和配置完成"
