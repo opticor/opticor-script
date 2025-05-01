@@ -192,8 +192,14 @@ function get_config_values() {
 # --- 生成配置文件 ---
 function generate_config_file() {
     print_info "正在生成 Hysteria 配置文件: ${HYSTERIA_CONFIG_FILE}..."
-    # 创建目录（如果不存在）
-    sudo mkdir -p "$(dirname "$HYSTERIA_CONFIG_FILE")" || { print_error "创建配置目录失败: $(dirname "$HYSTERIA_CONFIG_FILE")"; exit 1; }
+    local config_dir
+    config_dir=$(dirname "$HYSTERIA_CONFIG_FILE") # 获取目录路径 /etc/hysteria
+
+    # 创建目录（如果不存在）并设置目录权限
+    sudo mkdir -p "$config_dir" || { print_error "创建配置目录失败: ${config_dir}"; exit 1; }
+    # 确保 hysteria 组可以访问该目录 (r-x)
+    sudo chown root:hysteria "$config_dir" # 假设 hysteria 组存在
+    sudo chmod 750 "$config_dir"          # Owner: rwx, Group: r-x, Other: ---
 
     # 使用 sudo tee 写入文件，避免权限问题
     sudo tee "$HYSTERIA_CONFIG_FILE" > /dev/null <<EOF
@@ -245,10 +251,20 @@ EOF
         exit 1
     fi
 
-    # 设置权限（可选，但建议）
-    sudo chmod 600 "$HYSTERIA_CONFIG_FILE"
+    # --- 设置正确的所有权和权限 ---
+    print_info "设置配置文件权限..."
+    # 将文件所有者设为 root，组设为 hysteria
+    if ! sudo chown root:hysteria "$HYSTERIA_CONFIG_FILE"; then
+        print_warning "设置配置文件组所有权为 'hysteria' 失败。请确保 'hysteria' 组存在。"
+        print_warning "将尝试使用 644 权限作为备选方案..."
+        sudo chmod 644 "$HYSTERIA_CONFIG_FILE" # 允许所有人读取
+    else
+        # 设置权限为 640 (Owner: rw-, Group: r--, Other: ---)
+        sudo chmod 640 "$HYSTERIA_CONFIG_FILE"
+    fi
 
-    print_ok "配置文件 ${HYSTERIA_CONFIG_FILE} 生成成功！"
+
+    print_ok "配置文件 ${HYSTERIA_CONFIG_FILE} 生成和权限设置成功！"
 }
 
 # --- 启动服务 ---
