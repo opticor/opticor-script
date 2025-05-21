@@ -7,6 +7,7 @@ DEFAULT_PORT="443"
 DEFAULT_MASQUERADE_URL="https://bing.com" # 改为 bing.com 作为默认值
 HYSTERIA_CONFIG_FILE="/etc/hysteria/config.yaml"
 HYSTERIA_SERVICE_NAME="hysteria-server.service"
+SERVICE_DIR="/etc/systemd/system/"
 
 # --- 变量初始化 ---
 PORT=""
@@ -310,6 +311,8 @@ function output_summary() {
     echo -e "连接密码:      ${GREEN}${PASSWORD}${NC}"
     echo -e "伪装目标:      ${YELLOW}${MASQUERADE_URL}${NC}"
     echo -e "配置文件:      ${BLUE}${HYSTERIA_CONFIG_FILE}${NC}"
+    echo -e "systemctl地址: ${BLUE}${SERVICE_DIR}${HYSTERIA_SERVICE_NAME}"
+    echo -e " ↑部分虚拟机 service 文件 Working Dir需改为 /var/lib/hysteria↑ "
     echo -e "---------------------------------------------------"
     echo -e "常用命令:"
     echo -e "  查看状态:    ${BLUE}${service_status_cmd}${NC}"
