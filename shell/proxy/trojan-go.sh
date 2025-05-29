@@ -13,6 +13,7 @@ DEFAULT_TROJAN_PORT="443"
 CERT_RENEW_DAYS=30
 NGINX_CONFIG_FILE="/etc/nginx/conf.d/trojan-go-fallback.conf"
 DEFAULT_FALLBACK_URL="https://www.google.com"
+DEFAULT_ACME_SERVER="zerossl" # 默认 ACME 服务商
 
 # --- 变量初始化 ---
 DOMAIN=""
@@ -20,6 +21,7 @@ TROJAN_PORT="" # 将在后面根据参数或默认值设置
 TROJAN_PASSWORD="" # 将在后面根据参数或随机生成
 CF_TOKEN="" # 从参数或按需提示获取
 NON_INTERACTIVE=false # 非交互模式标志
+ACME_SERVER_TO_USE="" # 将用于存储选定的 ACME 服务商
 
 # --- 颜色代码 ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -40,12 +42,13 @@ function display_help() {
     echo "  --port <端口号>         指定 Trojan 监听端口 (默认: ${DEFAULT_TROJAN_PORT})"
     echo "  --password <密码>       指定 Trojan 连接密码 (默认: 随机生成)"
     echo "  --cf-token <令牌>       指定 Cloudflare API Token (如果需要申请/续期证书)"
+    echo "  --acme-server <服务商>  指定 ACME CA (例如: letsencrypt, zerossl, buypass) (默认: ${DEFAULT_ACME_SERVER})"
     echo "  --non-interactive      启用非交互模式，如果缺少必要参数则报错退出"
     echo "  --help                 显示此帮助信息"
     echo
     echo "示例:"
     echo "  $0 --domain sub.example.com --cf-token YOUR_CF_TOKEN"
-    echo "  $0 --domain sub.example.com --port 12345 --password mysecret --cf-token YOUR_CF_TOKEN --non-interactive"
+    echo "  $0 --domain sub.example.com --port 12345 --password mysecret --cf-token YOUR_CF_TOKEN --acme-server letsencrypt --non-interactive"
     exit 0
 }
 
@@ -65,6 +68,9 @@ while [[ $# -gt 0 ]]; do
         --cf-token)
             if [[ -z "$2" ]] || [[ "$2" == -* ]]; then print_error "错误: --cf-token 需要一个值"; exit 1; fi
             CF_TOKEN="$2"; shift 2 ;;
+        --acme-server)
+            if [[ -z "$2" ]] || [[ "$2" == -* ]]; then print_error "错误: --acme-server 需要一个值"; exit 1; fi
+            ACME_SERVER_TO_USE="$2"; shift 2 ;;
         --non-interactive)
             NON_INTERACTIVE=true; shift 1 ;;
         --help)
@@ -143,6 +149,23 @@ function get_user_input_values() {
     else
         print_info "使用提供的密码。"
     fi
+
+    # 4. ACME 服务商
+    if [[ -z "$ACME_SERVER_TO_USE" ]]; then
+        if ! $NON_INTERACTIVE; then
+            read -rp "请输入 ACME 服务商 (例如: letsencrypt, zerossl, buypass, 留空则使用默认 ${DEFAULT_ACME_SERVER}): " user_acme_server_choice
+            ACME_SERVER_TO_USE="${user_acme_server_choice:-$DEFAULT_ACME_SERVER}"
+        else
+            ACME_SERVER_TO_USE="$DEFAULT_ACME_SERVER" # 非交互模式下使用默认值
+        fi
+    fi
+    print_info "将使用 ACME 服务商: ${ACME_SERVER_TO_USE}"
+    # 对常见的服务商名称进行基本检查，acme.sh 会进行真正的验证
+    if [[ "$ACME_SERVER_TO_USE" != "letsencrypt" ]] && [[ "$ACME_SERVER_TO_USE" != "buypass" ]] && [[ "$ACME_SERVER_TO_USE" != "zerossl" ]] && [[ ! "$ACME_SERVER_TO_USE" =~ ^http ]]; then
+        # 这是一个简单的检查。 acme.sh 本身比较灵活。
+        # 如果它不是已知的短名称且不是 URL，则可能是较不常见的 acme.sh 别名或拼写错误。
+        print_warning "ACME 服务商 '${ACME_SERVER_TO_USE}' 可能不是一个标准的快捷名称。请确保它是 acme.sh 支持的有效服务商名或URL。常见的有: letsencrypt, zerossl, buypass。"
+    fi
 }
 
 # --- 安装 acme.sh ---
@@ -193,11 +216,11 @@ function issue_certificate() {
 
     # 执行证书操作
     if [ "$cert_needs_action" = "renew" ]; then
-        print_info "正在尝试续期证书..."; if "$ACME_CMD" --renew -d "$DOMAIN" --dns dns_cf --force --log; then print_ok "证书续期成功。"; cert_needs_install=true;
+        print_info "正在尝试续期证书 (服务商: ${ACME_SERVER_TO_USE})..."; if "$ACME_CMD" --renew -d "$DOMAIN" --dns dns_cf --force --log --server "${ACME_SERVER_TO_USE}"; then print_ok "证书续期成功。"; cert_needs_install=true; # Renew might not always need --server if already set, but explicit is fine
         else print_warning "证书续期失败。将尝试使用现有证书。"; fi
     elif [ "$cert_needs_action" = "issue" ]; then
-        print_info "正在申请新证书..."; if "$ACME_CMD" --issue --dns dns_cf -d "$DOMAIN" --log; then print_ok "新证书签发成功。"; cert_needs_install=true;
-        else print_error "签发新证书失败。检查 Token/DNS/日志。"; unset CF_Token; exit 1; fi
+        print_info "正在申请新证书 (服务商: ${ACME_SERVER_TO_USE})..."; if "$ACME_CMD" --issue --dns dns_cf -d "$DOMAIN" --log --server "${ACME_SERVER_TO_USE}"; then print_ok "新证书签发成功。"; cert_needs_install=true;
+        else print_error "签发新证书 (服务商: ${ACME_SERVER_TO_USE}) 失败。检查 Token/DNS/ACME服务商/日志。"; unset CF_Token; exit 1; fi
     fi
 
     # 安装证书
@@ -310,7 +333,7 @@ function display_summary() {
     print_info "--------------------------------------------------"; print_info "HTTP 回落 (端口 80):"; echo -e "  访问 http://${DOMAIN} 时将根据配置响应。"; echo -e "  Nginx 配置文件: ${NGINX_CONFIG_FILE}"
     print_info "--------------------------------------------------"; print_info "主要文件路径:"; echo -e "  Trojan-Go 配置: ${TROJAN_GO_CONFIG_DIR}/config.json"; echo -e "  证书文件: ${TROJAN_GO_CERT_DIR}"; echo -e "  日志文件: /var/log/trojan-go.log / journalctl -u trojan-go"
     print_info "--------------------------------------------------"; print_info "服务管理:"; echo -e "  Trojan-Go: ${GREEN}systemctl start/stop/restart/status trojan-go${NC}"; echo -e "  Nginx:     ${GREEN}systemctl start/stop/reload/status nginx${NC}"
-    print_info "--------------------------------------------------"; print_info "证书管理 (acme.sh):"; echo -e "  ${GREEN}列出:${NC} acme.sh --list"; echo -e "  ${GREEN}信息:${NC} acme.sh --info -d ${DOMAIN}"; echo -e "  ${GREEN}续期:${NC} acme.sh --renew -d ${DOMAIN} --force"
+    print_info "--------------------------------------------------"; print_info "证书管理 (acme.sh):"; echo -e "  ${GREEN}列出:${NC} acme.sh --list"; echo -e "  ${GREEN}信息:${NC} acme.sh --info -d ${DOMAIN}"; echo -e "  ${GREEN}续期:${NC} acme.sh --renew -d ${DOMAIN} --force --server ${ACME_SERVER_TO_USE}"
     print_info "--------------------------------------------------"; print_warning "重要提示:"; print_warning " - 妥善保管 CF Token。"; print_warning " - 确保防火墙允许 TCP 端口 ${TROJAN_PORT} 和 80。"; print_warning " - 如遇问题，检查日志。"
     print_info "--------------------------------------------------"
 }
@@ -320,9 +343,9 @@ main() {
     check_root
     # 参数解析已在脚本开头完成
     install_dependencies
-    get_user_input_values # 检查/获取/验证配置值
+    get_user_input_values # 检查/获取/验证配置值 (包括 ACME 服务商)
     install_acme
-    issue_certificate     # 按需获取Token，处理证书
+    issue_certificate     # 按需获取Token，处理证书 (使用选定的 ACME 服务商)
     install_trojan_go
     configure_trojan_go
     if ! setup_fallback_webserver; then # 设置 Nginx 回落
