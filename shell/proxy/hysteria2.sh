@@ -212,8 +212,8 @@ acme:
   domains:
     - ${DOMAIN}
   email: ${EMAIL}
-  # 使用 ZeroSSL 作为 CA，Let's Encrypt 也可以: ca: letsencrypt
-  ca: zerossl
+  # 使用 ZeroSSL/letsencrypt
+  ca: letsencrypt
   # DNS 验证方式
   type: dns
   dns:
