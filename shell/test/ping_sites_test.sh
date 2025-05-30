@@ -183,7 +183,7 @@ fi
 echo "🌐 网络延迟和丢包率测试脚本 v${SCRIPT_VERSION}"
 echo "-----------------------------------------"
 
-N_PINGS_ONCE_DEFAULT=5
+N_PINGS_ONCE_DEFAULT=10
 CONTINUOUS_INTERVAL_DEFAULT=3
 MAX_CUSTOM_PINGS_TIMEOUT_CAP=60 # PING命令本身的总超时上限（秒）
 
@@ -236,10 +236,12 @@ if [[ "$is_continuous_mode" == "false" ]]; then
 fi
 
 # --- 表头和数据行格式化 ---
-IPV4_HEADER_FMT="%-20s | %15s | %12s"
+IPV4_HEADER_FMT="%-20s     |   %15s | %12s"
+IPV4_SEP_FMT="%-20s | %15s | %12s"
 IPV4_DATA_FMT="%-20.20s | %15s | %12s"
 
-IPV6_HEADER_FMT="${IPV4_HEADER_FMT} | %15s | %12s"
+IPV6_HEADER_FMT="${IPV4_HEADER_FMT}     |   %15s | %12s"
+IPV6_SEP_FMT="${IPV4_HEADER_FMT} | %15s | %12s"
 IPV6_DATA_FMT="${IPV4_DATA_FMT} | %15s | %12s"
 
 header_host="目标主机"
@@ -255,10 +257,10 @@ SEP_LOSS="------------"
 print_header() {
     if [[ "$ipv6_available" == "true" ]]; then
         command printf "${IPV6_HEADER_FMT}\n" "$header_host" "$header_ipv4_latency" "$header_ipv4_loss" "$header_ipv6_latency" "$header_ipv6_loss"
-        command printf "${IPV6_HEADER_FMT}\n" "$SEP_HOST" "$SEP_LAT" "$SEP_LOSS" "$SEP_LAT" "$SEP_LOSS"
+        command printf "${IPV6_SEP_FMT}\n" "$SEP_HOST" "$SEP_LAT" "$SEP_LOSS" "$SEP_LAT" "$SEP_LOSS"
     else
         command printf "${IPV4_HEADER_FMT}\n" "$header_host" "$header_ipv4_latency" "$header_ipv4_loss"
-        command printf "${IPV4_HEADER_FMT}\n" "$SEP_HOST" "$SEP_LAT" "$SEP_LOSS"
+        command printf "${IPV4_SEP_FMT}\n" "$SEP_HOST" "$SEP_LAT" "$SEP_LOSS"
     fi
 }
 
