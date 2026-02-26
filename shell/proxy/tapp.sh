@@ -980,13 +980,6 @@ proxies:
       - h2
       - http/1.1
     skip-cert-verify: false
-proxy-groups:
-  - name: "Proxy"
-    type: select
-    proxies:
-      - "${DOMAIN}"
-rules:
-  - MATCH,Proxy
 EOF
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""

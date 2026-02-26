@@ -600,14 +600,6 @@ proxies:
     client-fingerprint: chrome
     skip-cert-verify: false
 
-proxy-groups:
-  - name: "Proxy"
-    type: select
-    proxies:
-      - "vapp-reality"
-
-rules:
-  - MATCH,Proxy
 EOF
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
