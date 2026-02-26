@@ -10,8 +10,8 @@ NC='\033[0m'
 
 # ==================== Defaults ====================
 DEFAULT_PORT=443
-DEFAULT_DEST="github.com:443"
-DEFAULT_SERVER_NAMES="github.com,www.github.com"
+DEFAULT_DEST="www.microsoft.com:443"
+DEFAULT_SERVER_NAMES="www.microsoft.com"
 DEFAULT_LOG_LEVEL="warning"
 INSTALL_DIR="/usr/local/bin"
 
