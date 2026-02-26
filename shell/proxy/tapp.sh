@@ -607,7 +607,7 @@ create_config() {
     "local_addr": "127.0.0.1",
     "local_port": ${TROJAN_INTERNAL_PORT},
     "remote_addr": "127.0.0.1",
-    "remote_port": 8080,
+    "remote_port": 80,
     "log_level": $(convert_log_level "$LOG_LEVEL"),
     "log_file": "${LOG_DIR}/${SERVICE_NAME}.log",
     "password": [
@@ -628,7 +628,6 @@ create_config() {
     },
     "mux": {
         "enabled":      true,
-        "concurrency":  8,
         "idle_timeout": 60
     }
 }
