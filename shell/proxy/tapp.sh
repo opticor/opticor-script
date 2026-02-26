@@ -619,7 +619,7 @@ create_config() {
         "sni":  "${DOMAIN}",
         "session_ticket": true,
         "reuse_session":  true,
-        "fallback_port":  8080
+        "fallback_port":  80
     },
     "tcp": {
         "no_delay":    true,
