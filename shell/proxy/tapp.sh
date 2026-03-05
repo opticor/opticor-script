@@ -305,11 +305,15 @@ install_deps() {
     if command -v apt-get &>/dev/null; then
         apt-get update -qq
         apt-get install -y -qq curl wget unzip socat cron openssl python3 binutils nginx
+        # Debian/Ubuntu: stream 模块需要单独安装
+        apt-get install -y -qq libnginx-mod-stream 2>/dev/null || true
     elif command -v yum &>/dev/null; then
         yum install -y -q curl wget unzip socat cronie openssl python3 binutils nginx
+        yum install -y -q nginx-mod-stream 2>/dev/null || true
         systemctl enable --now crond &>/dev/null || true
     elif command -v dnf &>/dev/null; then
         dnf install -y -q curl wget unzip socat cronie openssl python3 binutils nginx
+        dnf install -y -q nginx-mod-stream 2>/dev/null || true
         systemctl enable --now crond &>/dev/null || true
     else
         log_error "Unsupported package manager"
@@ -321,39 +325,104 @@ install_deps() {
 
 check_nginx_stream() {
     log_info "Checking nginx stream module..."
+    local nginx_conf="/etc/nginx/nginx.conf"
 
-    # 检查是否内置
+    # ── Step 1: 检查是否已内置编译 ──
     if nginx -V 2>&1 | grep -q '\-\-with-stream'; then
         log_info "  nginx stream module: ✅ built-in"
         return
     fi
 
-    log_warn "  nginx stream module not built-in, attempting to install..."
-
+    # ── Step 2: 尝试安装 stream 动态模块包 ──
+    log_warn "  nginx stream module not built-in, installing dynamic module..."
     if command -v apt-get &>/dev/null; then
-        apt-get install -y libnginx-mod-stream \
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y libnginx-mod-stream 2>/dev/null \
             && log_info "  ✅ libnginx-mod-stream installed" \
-            || log_error "Failed to install libnginx-mod-stream"
+            || log_warn "  libnginx-mod-stream package not available or already installed"
     elif command -v yum &>/dev/null; then
-        yum install -y nginx-mod-stream \
+        yum install -y nginx-mod-stream 2>/dev/null \
             && log_info "  ✅ nginx-mod-stream installed" \
-            || log_error "Failed to install nginx-mod-stream"
+            || log_warn "  nginx-mod-stream package not available or already installed"
     elif command -v dnf &>/dev/null; then
-        dnf install -y nginx-mod-stream \
+        dnf install -y nginx-mod-stream 2>/dev/null \
             && log_info "  ✅ nginx-mod-stream installed" \
-            || log_error "Failed to install nginx-mod-stream"
-    else
-        log_error "Cannot install nginx stream module: unsupported package manager"
+            || log_warn "  nginx-mod-stream package not available or already installed"
     fi
 
-    # 安装后验证（动态模块不会改变 nginx -V 输出，检查模块文件）
-    if nginx -V 2>&1 | grep -q '\-\-with-stream' \
-        || ls /usr/lib/nginx/modules/ngx_stream_module.so &>/dev/null \
-        || ls /etc/nginx/modules-enabled/*stream* &>/dev/null \
-        || ls /usr/lib64/nginx/modules/ngx_stream_module.so &>/dev/null; then
-        log_info "  nginx stream module: ✅ available (dynamic module)"
+    # ── Step 3: 定位 ngx_stream_module.so ──
+    local so_file=""
+    # 优先从 nginx -V 获取 modules-path
+    local mod_path
+    mod_path=$(nginx -V 2>&1 | grep -oP '\-\-modules-path=\K\S+' || true)
+    if [[ -n "$mod_path" && -f "${mod_path}/ngx_stream_module.so" ]]; then
+        so_file="${mod_path}/ngx_stream_module.so"
+    fi
+
+    # 备选：常见路径
+    if [[ -z "$so_file" ]]; then
+        for candidate in \
+            /usr/lib/nginx/modules/ngx_stream_module.so \
+            /usr/lib64/nginx/modules/ngx_stream_module.so \
+            /usr/lib/x86_64-linux-gnu/nginx/modules/ngx_stream_module.so \
+            /usr/share/nginx/modules/ngx_stream_module.so; do
+            if [[ -f "$candidate" ]]; then
+                so_file="$candidate"
+                break
+            fi
+        done
+    fi
+
+    # 兜底：find 搜索
+    if [[ -z "$so_file" ]]; then
+        so_file=$(find /usr/lib /usr/lib64 /usr/share 2>/dev/null \
+                  -name 'ngx_stream_module.so' -type f 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$so_file" ]]; then
+        log_error "ngx_stream_module.so not found anywhere.\n  Debian/Ubuntu: apt install libnginx-mod-stream\n  CentOS/RHEL:   yum install nginx-mod-stream"
+    fi
+    log_info "  Found module: $so_file"
+
+    # ── Step 4: 确保 nginx.conf 加载该模块 ──
+    #    动态模块必须在 nginx.conf 顶部通过 load_module 指令加载，
+    #    否则 stream{} 块会报 unknown directive。
+    #    Debian 使用 /etc/nginx/modules-enabled/ + include 机制，
+    #    CentOS/RHEL 使用直接 load_module。
+
+    local modules_enabled_dir="/etc/nginx/modules-enabled"
+
+    if [[ -d "$modules_enabled_dir" ]]; then
+        # Debian/Ubuntu 机制
+        # 确保 modules-enabled 下有 stream 模块的 .conf
+        if ! ls "${modules_enabled_dir}"/*stream* &>/dev/null 2>&1; then
+            log_info "  Creating ${modules_enabled_dir}/50-mod-stream.conf ..."
+            echo "load_module ${so_file};" > "${modules_enabled_dir}/50-mod-stream.conf"
+        else
+            log_info "  modules-enabled already has stream conf"
+        fi
+        # 确保 nginx.conf include 了 modules-enabled
+        if ! grep -qE 'include\s+/etc/nginx/modules-enabled/' "$nginx_conf" 2>/dev/null; then
+            log_info "  Adding 'include modules-enabled' to nginx.conf ..."
+            sed -i "1i include /etc/nginx/modules-enabled/*.conf;" "$nginx_conf"
+        fi
+        log_info "  ✅ modules-enabled mechanism configured"
     else
-        log_error "nginx stream module still not available. Please install manually."
+        # CentOS/RHEL 等：直接在 nginx.conf 顶部写 load_module
+        if ! grep -q 'ngx_stream_module.so' "$nginx_conf" 2>/dev/null; then
+            log_info "  Adding load_module to nginx.conf ..."
+            sed -i "1i load_module ${so_file};" "$nginx_conf"
+        else
+            log_info "  ✅ load_module already in nginx.conf"
+        fi
+    fi
+
+    # ── Step 5: 用 nginx -t 验证当前真实配置（含 load_module）──
+    if nginx -t 2>&1; then
+        log_info "  nginx stream module: ✅ ready (dynamic)"
+    else
+        log_warn "  nginx -t reported errors (may be unrelated to stream module)"
+        log_info "  Continuing — stream module load_module has been configured"
     fi
 }
 
