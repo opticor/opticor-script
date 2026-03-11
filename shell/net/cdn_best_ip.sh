@@ -5,6 +5,7 @@ set -euo pipefail
 QUERY_TIMES=3
 WRITE_HOSTS=0
 TARGET=""
+PREFER="ping"
 
 usage() {
     cat <<EOF
@@ -13,13 +14,13 @@ usage() {
 
 选项:
   -n, --times <次数>         每个DNS查询次数，默认 3
-  -w, --write-hosts          自动把最优IP写入 /etc/hosts（默认关闭）
+  -p, --prefer <ping|tcp>    如果 ICMP 和 TCP 测速最优不一样，默认优先选哪个 (默认: ping)
+  -w, --write-hosts          自动把最优IP写入 /etc/hosts（无此参数交互提示）
   -h, --help                 显示帮助
 
 示例:
   $0 www.example.com
-  $0 https://www.example.com/path
-  $0 -n 5 www.example.com
+  $0 -p tcp www.example.com
   $0 -n 5 -w www.example.com
 EOF
 }
@@ -30,6 +31,14 @@ while [[ $# -gt 0 ]]; do
             QUERY_TIMES="${2:-}"
             if [[ -z "$QUERY_TIMES" ]] || ! [[ "$QUERY_TIMES" =~ ^[0-9]+$ ]]; then
                 echo "错误: --times 需要一个正整数"
+                exit 1
+            fi
+            shift 2
+            ;;
+        -p|--prefer)
+            PREFER="${2:-}"
+            if [[ "$PREFER" != "ping" && "$PREFER" != "tcp" ]]; then
+                echo "错误: --prefer 只能是 ping 或 tcp"
                 exit 1
             fi
             shift 2
@@ -96,7 +105,9 @@ DNS_SERVERS=(
 
 TMP_IPS="$(mktemp)"
 TMP_HOSTS="$(mktemp)"
-trap 'rm -f "$TMP_IPS" "$TMP_HOSTS"' EXIT
+TMP_PING_RES="$(mktemp -d)"
+TMP_TCP_RES="$(mktemp -d)"
+trap 'rm -rf "$TMP_IPS" "$TMP_HOSTS" "$TMP_PING_RES" "$TMP_TCP_RES"' EXIT
 
 is_ipv4() {
     [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
@@ -106,7 +117,7 @@ query_a_records() {
     local dns="$1"
     local host="$2"
 
-    dig @"$dns" +short "$host" A 2>/dev/null | while read -r line; do
+    dig @"$dns" +time=3 +tries=1 +short "$host" A 2>/dev/null | while read -r line; do
         if is_ipv4 "$line"; then
             echo "$line"
         fi
@@ -114,12 +125,12 @@ query_a_records() {
 }
 
 get_authoritative_ns() {
-    dig +short NS "$HOST" 2>/dev/null | sed 's/\.$//'
+    dig +time=3 +tries=1 +short NS "$HOST" 2>/dev/null | sed 's/\.$//'
 }
 
 resolve_ns_ip() {
     local ns="$1"
-    dig +short "$ns" A 2>/dev/null | while read -r line; do
+    dig +time=3 +tries=1 +short "$ns" A 2>/dev/null | while read -r line; do
         if is_ipv4 "$line"; then
             echo "$line"
         fi
@@ -139,6 +150,15 @@ ping_avg() {
     fi
 
     rm -f "$outfile"
+}
+
+tcp_ping() {
+    local ip="$1"
+    local res
+    res=$(curl -o /dev/null -s -w "%{time_connect}\n" --connect-timeout 2 "http://$ip" 2>/dev/null || true)
+    if [[ -n "$res" && "$res" != "0.000000" && "$res" != "0.000" ]]; then
+        awk -v t="$res" 'BEGIN { printf "%.2f", t * 1000 }'
+    fi
 }
 
 write_hosts_record() {
@@ -195,18 +215,20 @@ echo "第一阶段：通过多个公共DNS多次查询，尽量收集更多CDN I
 echo
 
 for dns in "${DNS_SERVERS[@]}"; do
-    echo "查询公共DNS: $dns"
-    for ((i=1; i<=QUERY_TIMES; i++)); do
-        result="$(query_a_records "$dns" "$HOST" || true)"
-        if [[ -n "$result" ]]; then
-            echo "$result" >> "$TMP_IPS"
-            echo "  第 $i 次: 获取到 $(echo "$result" | wc -l | awk '{print $1}') 个IP"
-        else
-            echo "  第 $i 次: 无结果"
-        fi
-        sleep 0.3
-    done
+    (
+        for ((i=1; i<=QUERY_TIMES; i++)); do
+            result="$(query_a_records "$dns" "$HOST" || true)"
+            if [[ -n "$result" ]]; then
+                echo "$result" >> "$TMP_IPS"
+                echo "  [$dns] 第 $i 次: 获取到 $(echo "$result" | wc -l | awk '{print $1}') 个IP"
+            else
+                echo "  [$dns] 第 $i 次: 无结果"
+            fi
+            sleep 0.3
+        done
+    ) &
 done
+wait
 
 echo
 echo "第二阶段：尝试查询权威DNS服务器..."
@@ -227,20 +249,22 @@ if [[ -n "$AUTH_NS_LIST" ]]; then
 
         while read -r ns_ip; do
             [[ -z "$ns_ip" ]] && continue
-            echo "  通过NS IP查询: $ns_ip"
 
-            for ((i=1; i<=QUERY_TIMES; i++)); do
-                result="$(dig @"$ns_ip" +short "$HOST" A 2>/dev/null \
-                    | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
-                if [[ -n "$result" ]]; then
-                    echo "$result" >> "$TMP_IPS"
-                    echo "    第 $i 次: 获取到 $(echo "$result" | wc -l | awk '{print $1}') 个IP"
-                else
-                    echo "    第 $i 次: 无结果"
-                fi
-                sleep 0.3
-            done
+            (
+                for ((i=1; i<=QUERY_TIMES; i++)); do
+                    result="$(dig @"$ns_ip" +time=3 +tries=1 +short "$HOST" A 2>/dev/null \
+                        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+                    if [[ -n "$result" ]]; then
+                        echo "$result" >> "$TMP_IPS"
+                        echo "    [$ns_ip] 第 $i 次: 获取到 $(echo "$result" | wc -l | awk '{print $1}') 个IP"
+                    else
+                        echo "    [$ns_ip] 第 $i 次: 无结果"
+                    fi
+                    sleep 0.3
+                done
+            ) &
         done <<< "$ns_ips"
+        wait
     done <<< "$AUTH_NS_LIST"
 else
     echo "未获取到权威NS"
@@ -261,55 +285,132 @@ TOTAL_IP_COUNT="$(echo "$ALL_IPS" | wc -l | awk '{print $1}')"
 echo "共计: ${TOTAL_IP_COUNT} 个IP"
 echo
 
-best_ip=""
-best_latency=""
-
-echo "第三阶段：测试每个IP的ping延迟..."
+echo "第三阶段：并发测试每个IP的 Ping (ICMP) 和 TCP (80端口) 延迟..."
 echo
 
 while read -r ip; do
     [[ -z "$ip" ]] && continue
 
-    latency="$(ping_avg "$ip" || true)"
-
-    if [[ -z "$latency" ]]; then
-        echo "IP: $ip -> ping失败"
-        continue
-    fi
-
-    echo "IP: $ip -> 平均延迟: ${latency} ms"
-
-    if [[ -z "$best_latency" ]]; then
-        best_ip="$ip"
-        best_latency="$latency"
-    else
-        if awk -v a="$latency" -v b="$best_latency" 'BEGIN {exit !(a < b)}'; then
-            best_ip="$ip"
-            best_latency="$latency"
+    (
+        latency="$(ping_avg "$ip" || true)"
+        if [[ -n "$latency" ]]; then
+            echo "$latency" > "$TMP_PING_RES/$ip"
         fi
-    fi
+    ) &
+    (
+        tcp_lat="$(tcp_ping "$ip" || true)"
+        if [[ -n "$tcp_lat" ]]; then
+            echo "$tcp_lat" > "$TMP_TCP_RES/$ip"
+        fi
+    ) &
 done <<< "$ALL_IPS"
+wait
+
+echo "--- Ping (ICMP) 测速结果 ---"
+best_ping_ip=""
+best_ping_latency=""
+if ls "$TMP_PING_RES"/* >/dev/null 2>&1; then
+    for res_file in "$TMP_PING_RES"/*; do
+        [[ -e "$res_file" ]] || continue
+        ip="$(basename "$res_file")"
+        latency="$(cat "$res_file")"
+        echo "IP: $ip -> Ping 平均延迟: ${latency} ms"
+        if [[ -z "$best_ping_latency" ]] || awk -v a="$latency" -v b="$best_ping_latency" 'BEGIN {exit !(a < b)}'; then
+            best_ping_ip="$ip"
+            best_ping_latency="$latency"
+        fi
+    done
+else
+    echo "所有 IP 的 Ping 均失败"
+fi
+
+echo
+echo "--- TCP (80端口) 测速结果 ---"
+best_tcp_ip=""
+best_tcp_latency=""
+if ls "$TMP_TCP_RES"/* >/dev/null 2>&1; then
+    for res_file in "$TMP_TCP_RES"/*; do
+        [[ -e "$res_file" ]] || continue
+        ip="$(basename "$res_file")"
+        latency="$(cat "$res_file")"
+        echo "IP: $ip -> TCP 平均延迟: ${latency} ms"
+        if [[ -z "$best_tcp_latency" ]] || awk -v a="$latency" -v b="$best_tcp_latency" 'BEGIN {exit !(a < b)}'; then
+            best_tcp_ip="$ip"
+            best_tcp_latency="$latency"
+        fi
+    done
+else
+    echo "所有 IP 的 TCP 测速均失败"
+fi
 
 echo
 echo "==================== 汇总 ===================="
 echo "目标主机  : $HOST"
 echo "收集IP数量: $TOTAL_IP_COUNT"
-
-if [[ -n "$best_ip" ]]; then
-    echo "延迟最小IP: $best_ip"
-    echo "最小平均延迟: ${best_latency} ms"
-    echo "最优hosts记录: $best_ip $HOST"
-else
-    echo "延迟最小IP: 无（所有IP ping失败）"
-fi
+echo "最优 Ping IP: ${best_ping_ip:-无} (延迟: ${best_ping_latency:-N/A} ms)"
+echo "最优 TCP IP : ${best_tcp_ip:-无} (延迟: ${best_tcp_latency:-N/A} ms)"
 echo "==============================================="
 
-if [[ -n "$best_ip" && "$WRITE_HOSTS" -eq 1 ]]; then
-    echo
-    echo "第四阶段：写入 /etc/hosts ..."
-    write_hosts_record "$best_ip" "$HOST"
+final_ip=""
+if [[ -n "$best_ping_ip" && -n "$best_tcp_ip" ]]; then
+    if [[ "$best_ping_ip" == "$best_tcp_ip" ]]; then
+        final_ip="$best_ping_ip"
+        echo "发现最优 IP 一致: $final_ip"
+    else
+        if [[ "$PREFER" == "tcp" ]]; then
+            final_ip="$best_tcp_ip"
+            echo "最优 IP 不一致，根据配置优先使用 TCP 最优 IP: $final_ip"
+        else
+            final_ip="$best_ping_ip"
+            echo "最优 IP 不一致，根据配置优先使用 Ping 最优 IP: $final_ip"
+        fi
+    fi
+elif [[ -n "$best_ping_ip" ]]; then
+    final_ip="$best_ping_ip"
+    echo "仅有 Ping 测速结果，使用: $final_ip"
+elif [[ -n "$best_tcp_ip" ]]; then
+    final_ip="$best_tcp_ip"
+    echo "仅有 TCP 测速结果，使用: $final_ip"
+else
+    echo "所有测速均失败，无法选择可用 IP"
+    exit 1
 fi
 
-if [[ -z "$best_ip" ]]; then
-    exit 1
+if [[ "$WRITE_HOSTS" -eq 1 ]]; then
+    # 已带 -w，自动写入
+    if [[ -n "$final_ip" ]]; then
+        echo
+        echo "第四阶段：自动写入 /etc/hosts ..."
+        write_hosts_record "$final_ip" "$HOST"
+    fi
+else
+    # 未带 -w，交互式提示
+    if [[ -n "$final_ip" ]]; then
+        echo
+        if [[ -n "$best_ping_ip" && -n "$best_tcp_ip" && "$best_ping_ip" != "$best_tcp_ip" ]]; then
+            echo "测速结果出现差异："
+            echo "  1) 写入 Ping 最优 IP: $best_ping_ip"
+            echo "  2) 写入 TCP 最优 IP: $best_tcp_ip"
+            echo "  0) 不写入 (退出)"
+            read -r -p "请输入序号选择要写入的 IP [0]: " choice </dev/tty || true
+            case "$choice" in
+                1)
+                    write_hosts_record "$best_ping_ip" "$HOST"
+                    ;;
+                2)
+                    write_hosts_record "$best_tcp_ip" "$HOST"
+                    ;;
+                *)
+                    echo "已取消写入"
+                    ;;
+            esac
+        else
+            read -r -p "是否将唯一的最佳 IP ($final_ip) 写入 /etc/hosts？[y/N]: " choice </dev/tty || true
+            if [[ "$choice" =~ ^[Yy]$ ]]; then
+                write_hosts_record "$final_ip" "$HOST"
+            else
+                echo "已取消写入"
+            fi
+        fi
+    fi
 fi
