@@ -167,6 +167,112 @@ api_export() {
 # ====================== 备份逻辑 ==========================
 
 # 全量备份：直接保存 export 快照
+# POST /usage/import - import and merge snapshot
+api_import() {
+    local source_file="$1"
+    log "INFO" "Request POST ${BASE_URL}/usage/import from file: ${source_file}"
+
+    local http_code tmp_body
+    tmp_body=$(mktemp)
+    local exit_code
+
+    if [[ "$TLS_INSECURE" == "true" && -n "$ROUTER_TLS_NAME" ]]; then
+        http_code=$(curl -s -k \
+            --resolve "${ROUTER_TLS_NAME}:${ROUTER_PORT}:${ROUTER_HOST}" \
+            -X POST \
+            -o "${tmp_body}" \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${source_file}" \
+            --connect-timeout 10 \
+            --max-time 60 \
+            "${BASE_URL}/usage/import")
+        exit_code=$?
+    elif [[ "$TLS_INSECURE" == "true" ]]; then
+        http_code=$(curl -s -k \
+            -X POST \
+            -o "${tmp_body}" \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${source_file}" \
+            --connect-timeout 10 \
+            --max-time 60 \
+            "${BASE_URL}/usage/import")
+        exit_code=$?
+    elif [[ -n "$ROUTER_TLS_NAME" ]]; then
+        http_code=$(curl -s \
+            --resolve "${ROUTER_TLS_NAME}:${ROUTER_PORT}:${ROUTER_HOST}" \
+            -X POST \
+            -o "${tmp_body}" \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${source_file}" \
+            --connect-timeout 10 \
+            --max-time 60 \
+            "${BASE_URL}/usage/import")
+        exit_code=$?
+    else
+        http_code=$(curl -s \
+            -X POST \
+            -o "${tmp_body}" \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${source_file}" \
+            --connect-timeout 10 \
+            --max-time 60 \
+            "${BASE_URL}/usage/import")
+        exit_code=$?
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        rm -f "$tmp_body"
+        die "curl request failed [exit=${exit_code}]"
+    fi
+
+    if [[ "$http_code" != "200" ]]; then
+        log "ERROR" "HTTP ${http_code}, response: $(cat "${tmp_body}")"
+        rm -f "$tmp_body"
+        return 1
+    fi
+
+    cat "$tmp_body"
+    rm -f "$tmp_body"
+    return 0
+}
+
+do_restore() {
+    local restore_path="$1"
+    log "INFO" "======== Restore Start ========"
+
+    [[ -f "$restore_path" ]] || die "restore file not found: ${restore_path}"
+    [[ -r "$restore_path" ]] || die "restore file is not readable: ${restore_path}"
+    jq -e . "$restore_path" >/dev/null || die "restore file is not valid JSON: ${restore_path}"
+
+    local snapshot
+    snapshot=$(cat "$restore_path") || die "failed to read restore file: ${restore_path}"
+    validate_snapshot "$snapshot" || die "invalid snapshot structure in restore file: ${restore_path}"
+
+    local import_result
+    import_result=$(api_import "$restore_path") || die "restore import failed: ${restore_path}"
+
+    local added skipped total_requests failed_requests
+    added=$(echo "$import_result" | jq '.added // 0')
+    skipped=$(echo "$import_result" | jq '.skipped // 0')
+    total_requests=$(echo "$import_result" | jq '.total_requests // 0')
+    failed_requests=$(echo "$import_result" | jq '.failed_requests // 0')
+
+    log "INFO" "Restore completed"
+    log "INFO" "  file: ${restore_path}"
+    log "INFO" "  added: ${added}"
+    log "INFO" "  skipped: ${skipped}"
+    log "INFO" "  total_requests: ${total_requests}"
+    log "INFO" "  failed_requests: ${failed_requests}"
+    log "INFO" "======== Restore End =========="
+}
 do_full_backup() {
     log "INFO" "======== 全量备份开始 ========"
 
@@ -409,6 +515,7 @@ show_help() {
   -k, --key    KEY     API Key
   -d, --dir    DIR     备份目录     (默认: ${BACKUP_DIR})
   -f, --file   FILE    备份文件名   (默认: ${BACKUP_FILE})
+  -r, --restore FILE   从指定 JSON 文件恢复并导入 usage（合并去重）
   --https              等价于 --scheme https
   --insecure           HTTPS 时跳过证书校验
   --full               强制全量备份
@@ -421,11 +528,13 @@ show_help() {
   $(basename "$0") --https -h 127.0.0.1 -p 8320 --tls-name router.example.com -k your_key
   $(basename "$0") -h 192.168.1.1 -p 8317 -k your_key -d /data/backup
   $(basename "$0") --full -k your_key
+  $(basename "$0") --restore /data/backup/usage_backup.json -k your_key
 EOF
 }
 
 FORCE_FULL=false
 NO_ARCHIVE=false
+RESTORE_FILE=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -437,15 +546,16 @@ parse_args() {
             -k|--key)        require_arg_value "$1" "${2:-}"; API_KEY="$2"; shift 2 ;;
             -d|--dir)        require_arg_value "$1" "${2:-}"; BACKUP_DIR="$2"; shift 2 ;;
             -f|--file)       require_arg_value "$1" "${2:-}"; BACKUP_FILE="$2"; shift 2 ;;
+            -r|--restore)    require_arg_value "$1" "${2:-}"; RESTORE_FILE="$2"; shift 2 ;;
             --https)         ROUTER_SCHEME="https"; shift ;;
             --insecure)      TLS_INSECURE=true; shift ;;
             --full)          FORCE_FULL=true;  shift   ;;
             --no-archive)    NO_ARCHIVE=true;  shift   ;;
             --help)          show_help; exit 0 ;;
-            *) die "未知参数: $1，使用 --help 查看帮助" ;;
+            *) die "Unknown argument: $1, use --help for usage" ;;
         esac
     done
-    # 参数解析后更新依赖变量
+    # Refresh derived vars after parsing arguments
     if [[ -n "$ROUTER_TLS_NAME" ]]; then
         REQUEST_HOST="$ROUTER_TLS_NAME"
     else
@@ -453,6 +563,9 @@ parse_args() {
     fi
     BASE_URL="${ROUTER_SCHEME}://${REQUEST_HOST}:${ROUTER_PORT}/v0/management"
     BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILE}"
+
+    [[ -n "$RESTORE_FILE" && "$FORCE_FULL" == "true" ]] \
+        && die "--restore cannot be used together with --full"
 }
 
 # ====================== 主流程 ==========================
@@ -461,27 +574,33 @@ main() {
     parse_args "$@"
 
     log "INFO" "================================================"
-    log "INFO" " CLIProxyAPI 备份脚本"
-    log "INFO" " 目标: ${BASE_URL}"
+    log "INFO" " CLIProxyAPI backup script"
+    log "INFO" " Target: ${BASE_URL}"
     if [[ -n "$ROUTER_TLS_NAME" ]]; then
-        log "INFO" " 连接: ${ROUTER_HOST}:${ROUTER_PORT} (TLS 域名: ${ROUTER_TLS_NAME})"
+        log "INFO" " Connect: ${ROUTER_HOST}:${ROUTER_PORT} (TLS name: ${ROUTER_TLS_NAME})"
     fi
-    log "INFO" " 备份: ${BACKUP_PATH}"
+    log "INFO" " Backup: ${BACKUP_PATH}"
     log "INFO" "================================================"
 
     check_deps
     check_config
-    mkdir -p "${BACKUP_DIR}" || die "无法创建备份目录: ${BACKUP_DIR}"
+
+    if [[ -n "$RESTORE_FILE" ]]; then
+        do_restore "$RESTORE_FILE"
+        return 0
+    fi
+
+    mkdir -p "${BACKUP_DIR}" || die "failed to create backup dir: ${BACKUP_DIR}"
 
     if [[ "$FORCE_FULL" == "true" ]]; then
-        log "INFO" "强制全量备份模式"
+        log "INFO" "Force full backup mode"
         [[ "$NO_ARCHIVE" == "false" ]] && archive_backup
         do_full_backup
     elif [[ ! -f "${BACKUP_PATH}" ]]; then
-        log "INFO" "备份文件不存在，执行全量备份"
+        log "INFO" "Backup file missing, running full backup"
         do_full_backup
     else
-        log "INFO" "备份文件已存在，执行增量备份"
+        log "INFO" "Backup file exists, running incremental backup"
         [[ "$NO_ARCHIVE" == "false" ]] && archive_backup
         do_incremental_backup
     fi
