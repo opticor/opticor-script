@@ -18,11 +18,13 @@ BACKUP_DIR="./router_backup"        # 备份目录
 BACKUP_FILE="usage_backup.json"     # 主备份文件（始终保持最新全量）
 LOG_LEVEL="${LOG_LEVEL:-INFO}"      # DEBUG / INFO / WARN / ERROR
 TLS_INSECURE=false
+SERVICE_UNIT="cliproxyapi.service"  # 默认 systemd 服务名
 
 # ====================== 内部变量 ==========================
 REQUEST_HOST="${ROUTER_HOST}"
 BASE_URL="${ROUTER_SCHEME}://${REQUEST_HOST}:${ROUTER_PORT}/v0/management"
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILE}"
+TMP_RESTART_BACKUP=""
 
 # ====================== 工具函数 ==========================
 
@@ -94,6 +96,12 @@ write_snapshot_file() {
         || { rm -f "$tmp_file"; die "替换备份文件失败: ${target}"; }
 }
 
+cleanup_restart_tmp() {
+    if [[ -n "${TMP_RESTART_BACKUP}" && -f "${TMP_RESTART_BACKUP}" ]]; then
+        rm -f "${TMP_RESTART_BACKUP}" || true
+        TMP_RESTART_BACKUP=""
+    fi
+}
 # ====================== API 函数 ==========================
 
 # GET /usage/export — 导出完整快照
@@ -272,6 +280,89 @@ do_restore() {
     log "INFO" "  total_requests: ${total_requests}"
     log "INFO" "  failed_requests: ${failed_requests}"
     log "INFO" "======== Restore End =========="
+}
+detect_running_service_scope() {
+    local service_name="$1"
+
+    if systemctl --user is-active --quiet "${service_name}" 2>/dev/null; then
+        echo "user"
+        return 0
+    fi
+
+    if systemctl is-active --quiet "${service_name}" 2>/dev/null; then
+        echo "system"
+        return 0
+    fi
+
+    return 1
+}
+
+restart_service_by_scope() {
+    local scope="$1"
+    local service_name="$2"
+
+    if [[ "$scope" == "user" ]]; then
+        log "INFO" "重启用户服务: systemctl --user restart ${service_name}"
+        systemctl --user restart "${service_name}" || return 1
+        systemctl --user is-active --quiet "${service_name}" || return 1
+        return 0
+    fi
+
+    log "INFO" "重启系统服务: systemctl restart ${service_name}"
+    if systemctl restart "${service_name}" 2>/dev/null; then
+        :
+    elif command -v sudo &>/dev/null; then
+        sudo systemctl restart "${service_name}" || return 1
+    else
+        return 1
+    fi
+
+    if systemctl is-active --quiet "${service_name}" 2>/dev/null; then
+        :
+    elif command -v sudo &>/dev/null; then
+        sudo systemctl is-active --quiet "${service_name}" || return 1
+    else
+        return 1
+    fi
+}
+
+do_restart_with_backup_restore() {
+    local service_name="$1"
+    local scope snapshot exported_at total_requests
+
+    command -v systemctl &>/dev/null || die "缺少依赖: systemctl"
+    mkdir -p "${BACKUP_DIR}" || die "无法创建备份目录: ${BACKUP_DIR}"
+
+    TMP_RESTART_BACKUP=$(mktemp "${BACKUP_DIR}/.tmp_restart_usage_XXXXXX.json") \
+        || die "创建重启临时备份文件失败"
+    trap cleanup_restart_tmp EXIT
+
+    log "INFO" "======== 重启服务流程开始 ========"
+    log "INFO" "Step 1/4: 导出全量快照到临时文件"
+    snapshot=$(api_export) || die "导出全量快照失败"
+    validate_snapshot "$snapshot" || die "导出的快照格式无效"
+    write_snapshot_file "$snapshot" "${TMP_RESTART_BACKUP}"
+    exported_at=$(echo "$snapshot" | jq -r '.exported_at // "unknown"')
+    total_requests=$(echo "$snapshot" | jq '.usage.total_requests // 0')
+    log "INFO" "  临时文件: ${TMP_RESTART_BACKUP}"
+    log "INFO" "  exported_at: ${exported_at}, total_requests: ${total_requests}"
+
+    log "INFO" "Step 2/4: 检测并重启正在运行的服务"
+    scope=$(detect_running_service_scope "${service_name}") \
+        || die "未检测到正在运行的服务: ${service_name}（--user 与系统级都未运行）"
+    log "INFO" "  运行作用域: ${scope}"
+    restart_service_by_scope "${scope}" "${service_name}" \
+        || die "服务重启失败: ${service_name} (${scope})"
+    log "INFO" "  服务重启成功"
+
+    log "INFO" "Step 3/4: 从临时文件恢复快照"
+    do_restore "${TMP_RESTART_BACKUP}"
+
+    log "INFO" "Step 4/4: 清理临时文件"
+    cleanup_restart_tmp
+    trap - EXIT
+
+    log "INFO" "======== 重启服务流程完成 ========"
 }
 do_full_backup() {
     log "INFO" "======== 全量备份开始 ========"
@@ -516,6 +607,8 @@ show_help() {
   -d, --dir    DIR     备份目录     (默认: ${BACKUP_DIR})
   -f, --file   FILE    备份文件名   (默认: ${BACKUP_FILE})
   -r, --restore FILE   从指定 JSON 文件恢复并导入 usage（合并去重）
+  --restart            重启服务并自动执行临时全量备份->恢复
+  --service-unit UNIT  要重启的 systemd 服务名 (默认: ${SERVICE_UNIT})
   --https              等价于 --scheme https
   --insecure           HTTPS 时跳过证书校验
   --full               强制全量备份
@@ -529,12 +622,14 @@ show_help() {
   $(basename "$0") -h 192.168.1.1 -p 8317 -k your_key -d /data/backup
   $(basename "$0") --full -k your_key
   $(basename "$0") --restore /data/backup/usage_backup.json -k your_key
+  $(basename "$0") --restart --service-unit cliproxyapi.service -k your_key
 EOF
 }
 
 FORCE_FULL=false
 NO_ARCHIVE=false
 RESTORE_FILE=""
+RESTART_SERVICE=false
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -547,15 +642,17 @@ parse_args() {
             -d|--dir)        require_arg_value "$1" "${2:-}"; BACKUP_DIR="$2"; shift 2 ;;
             -f|--file)       require_arg_value "$1" "${2:-}"; BACKUP_FILE="$2"; shift 2 ;;
             -r|--restore)    require_arg_value "$1" "${2:-}"; RESTORE_FILE="$2"; shift 2 ;;
+            --restart)       RESTART_SERVICE=true; shift ;;
+            --service-unit)  require_arg_value "$1" "${2:-}"; SERVICE_UNIT="$2"; shift 2 ;;
             --https)         ROUTER_SCHEME="https"; shift ;;
             --insecure)      TLS_INSECURE=true; shift ;;
-            --full)          FORCE_FULL=true;  shift   ;;
-            --no-archive)    NO_ARCHIVE=true;  shift   ;;
+            --full)          FORCE_FULL=true;  shift ;;
+            --no-archive)    NO_ARCHIVE=true;  shift ;;
             --help)          show_help; exit 0 ;;
             *) die "Unknown argument: $1, use --help for usage" ;;
         esac
     done
-    # Refresh derived vars after parsing arguments
+
     if [[ -n "$ROUTER_TLS_NAME" ]]; then
         REQUEST_HOST="$ROUTER_TLS_NAME"
     else
@@ -566,6 +663,10 @@ parse_args() {
 
     [[ -n "$RESTORE_FILE" && "$FORCE_FULL" == "true" ]] \
         && die "--restore cannot be used together with --full"
+    [[ "$RESTART_SERVICE" == "true" && -n "$RESTORE_FILE" ]] \
+        && die "--restart cannot be used together with --restore"
+    [[ "$RESTART_SERVICE" == "true" && "$FORCE_FULL" == "true" ]] \
+        && die "--restart cannot be used together with --full"
 }
 
 # ====================== 主流程 ==========================
@@ -584,6 +685,11 @@ main() {
 
     check_deps
     check_config
+
+    if [[ "$RESTART_SERVICE" == "true" ]]; then
+        do_restart_with_backup_restore "${SERVICE_UNIT}"
+        return 0
+    fi
 
     if [[ -n "$RESTORE_FILE" ]]; then
         do_restore "$RESTORE_FILE"
