@@ -1980,24 +1980,9 @@ quick_install() {
         exit 1
     fi
 
-    # 生成配置
-    if [[ ! -f "$SMARTDNS_CONF" ]] || [[ ! -s "$SMARTDNS_CONF" ]]; then
-        echo ""
-        echo "请选择配置模板:"
-        echo "  1) 默认配置 (无分组: 1.1.1.1/8.8.8.8/223.5.5.5 + DoH/DoT)"
-        echo "  2) 基础配置 (通用，含详细注释)"
-        echo "  3) 国内优化配置 (分组分流)"
-        echo ""
-        read -rp "请选择 [1-3] (默认1): " config_choice
-        config_choice="${config_choice:-1}"
-
-        case "$config_choice" in
-            1) generate_simple_config ;;
-            2) generate_basic_config ;;
-            3) generate_china_optimized_config ;;
-            *) generate_simple_config ;;
-        esac
-    fi
+    # 快速安装默认使用“默认配置（无分组）”
+    print_info "应用默认配置模板（无分组）..."
+    generate_simple_config
 
     # 处理端口冲突
     resolve_port_conflict 53
@@ -2005,11 +1990,11 @@ quick_install() {
     # 验证配置
     validate_config
 
-    # 启动服务
-    start_smartdns
-
     # 设置开机自启
     enable_autostart
+
+    # 启动服务
+    start_smartdns
 
     # 设置系统 DNS
     echo ""
