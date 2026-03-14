@@ -32,8 +32,27 @@ echo_error() {
     echo -e "${RED}[错误]${NC} $1"
 }
 
+is_valid_ipv4() {
+    local ip=$1
+    local IFS='.'
+    local -a octets
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+
+    for octet in "${octets[@]}"; do
+        ((10#$octet >= 0 && 10#$octet <= 255)) || return 1
+    done
+}
+
+urlencode() {
+    jq -nr --arg v "$1" '$v|@uri'
+}
+
 is_private_ipv4() {
     local ip=$1
+    is_valid_ipv4 "$ip" || return 1
     [[ "$ip" =~ ^10\. ]] \
         || [[ "$ip" =~ ^127\. ]] \
         || [[ "$ip" =~ ^192\.168\. ]] \
@@ -58,19 +77,37 @@ echo_info "开始配置 Shadowsocks 服务..."
 
 # 获取服务器 IP 地址 (优先公网 IP，失败则使用本机 IP 并提示确认)
 server_ip=$(detect_public_ip)
+if [ -n "$server_ip" ] && ! is_valid_ipv4 "$server_ip"; then
+    echo_warning "自动检测到的 IP (${server_ip}) 不是有效 IPv4，已忽略。"
+    server_ip=""
+fi
 if [ -z "$server_ip" ]; then
     server_ip=$(hostname -I | awk '{print $1}')
+    if [ -n "$server_ip" ] && ! is_valid_ipv4 "$server_ip"; then
+        echo_warning "本机地址 (${server_ip}) 不是有效 IPv4，请手动输入公网 IPv4。"
+        server_ip=""
+    fi
 fi
 if [ -z "$server_ip" ]; then
     read -rp "$(echo -e "${YELLOW}请输入您的服务器公网 IP 地址: ${NC}")" server_ip
     if [ -z "$server_ip" ]; then
         echo_error "服务器 IP 地址不能为空！"
         exit 1
+    elif ! is_valid_ipv4 "$server_ip"; then
+        echo_error "无效的 IPv4 地址：${server_ip}"
+        exit 1
     fi
 elif is_private_ipv4 "$server_ip"; then
     echo_warning "自动检测到的 IP (${server_ip}) 可能是内网地址。"
     read -rp "$(echo -e "${YELLOW}请输入服务器公网 IP 地址 (回车保留当前值): ${NC}")" input_server_ip
-    server_ip=${input_server_ip:-$server_ip}
+    if [ -n "$input_server_ip" ]; then
+        if is_valid_ipv4 "$input_server_ip"; then
+            server_ip=$input_server_ip
+        else
+            echo_error "无效的 IPv4 地址：${input_server_ip}"
+            exit 1
+        fi
+    fi
 fi
 
 # 获取端口号
@@ -261,6 +298,8 @@ handle_ufw() {
             if [ -z "$specific_ip" ]; then
                 echo_warning "未输入 IP 地址，将不开放端口。"
                 echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则。"
+            elif ! is_valid_ipv4 "$specific_ip"; then
+                echo_error "无效的 IPv4 地址：${specific_ip}。将不自动开放端口。"
             else
                 echo_info "正在为 IP $specific_ip 开放端口 $server_port (TCP/UDP) ..."
                 if ufw allow from "$specific_ip" to any port "$server_port" proto tcp \
@@ -300,7 +339,7 @@ handle_firewalld() {
             default_zone=$(firewall-cmd --get-default-zone 2>/dev/null)
             if [ -z "$default_zone" ]; then
                 echo_error "无法获取 firewalld 默认 zone。"
-                break
+                return 1
             fi
             if ensure_firewalld_port "$default_zone" "$server_port/tcp" \
                 && ensure_firewalld_port "$default_zone" "$server_port/udp" \
@@ -316,6 +355,8 @@ handle_firewalld() {
             if [ -z "$specific_ip" ]; then
                 echo_warning "未输入 IP 地址，将不开放端口。"
                 echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则。"
+            elif ! is_valid_ipv4 "$specific_ip"; then
+                echo_error "无效的 IPv4 地址：${specific_ip}。将不自动开放端口。"
             else
                 echo_info "正在为 IP $specific_ip 开放端口 $server_port (TCP/UDP) ..."
                 if ensure_firewalld_zone sslimit \
@@ -355,8 +396,9 @@ fi
 
 
 # 生成 ss:// 链接
-ss_link_plain="ss://${encrypt_method}:${ss_password}@${server_ip}:${server_port}"
-ss_link_base64="ss://$(echo -n "${encrypt_method}:${ss_password}@${server_ip}:${server_port}" | base64 -w 0)"
+encoded_password=$(urlencode "$ss_password")
+ss_link_plain="ss://${encrypt_method}:${encoded_password}@${server_ip}:${server_port}"
+ss_link_base64="ss://$(echo -n "${encrypt_method}:${ss_password}@${server_ip}:${server_port}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')"
 clash_password_json=$(jq -Rn --arg v "$ss_password" '$v')
 
 # 输出必要信息
