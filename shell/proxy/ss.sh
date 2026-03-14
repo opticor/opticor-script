@@ -175,6 +175,32 @@ fi
 firewall_action_taken=false
 restricted_ip=""
 
+ensure_firewalld_zone() {
+    local zone_name=$1
+    if firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "$zone_name"; then
+        return 0
+    fi
+    firewall-cmd --permanent --new-zone="$zone_name" --quiet
+}
+
+ensure_firewalld_source() {
+    local zone_name=$1
+    local source_ip=$2
+    if firewall-cmd --permanent --zone="$zone_name" --query-source="$source_ip" --quiet; then
+        return 0
+    fi
+    firewall-cmd --permanent --zone="$zone_name" --add-source="$source_ip" --quiet
+}
+
+ensure_firewalld_port() {
+    local zone_name=$1
+    local port_proto=$2
+    if firewall-cmd --permanent --zone="$zone_name" --query-port="$port_proto" --quiet; then
+        return 0
+    fi
+    firewall-cmd --permanent --zone="$zone_name" --add-port="$port_proto" --quiet
+}
+
 handle_ufw() {
     echo_info "检测到 ufw 防火墙。请选择如何开放端口 $server_port:"
     echo -e "  1) ${GREEN}为所有 IP 开放端口 (推荐，如果服务器公网访问)${NC}"
@@ -186,11 +212,12 @@ handle_ufw() {
     case $fw_choice in
         1)
             echo_info "正在为所有 IP 开放端口 $server_port (TCP/UDP) ..."
-            ufw allow "$server_port/tcp"
-            ufw allow "$server_port/udp"
-            ufw reload
-            echo_success "ufw: 端口 $server_port (TCP/UDP) 已为所有 IP 开放。"
-            firewall_action_taken=true
+            if ufw allow "$server_port/tcp" && ufw allow "$server_port/udp" && ufw reload; then
+                echo_success "ufw: 端口 $server_port (TCP/UDP) 已为所有 IP 开放。"
+                firewall_action_taken=true
+            else
+                echo_error "ufw 规则应用失败，请手动检查 ufw 状态和规则。"
+            fi
             ;;
         2)
             read -rp "$(echo -e "${YELLOW}请输入允许访问的特定 IP 地址: ${NC}")" specific_ip
@@ -199,12 +226,15 @@ handle_ufw() {
                 echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则。"
             else
                 echo_info "正在为 IP $specific_ip 开放端口 $server_port (TCP/UDP) ..."
-                ufw allow from "$specific_ip" to any port "$server_port" proto tcp
-                ufw allow from "$specific_ip" to any port "$server_port" proto udp
-                ufw reload
-                echo_success "ufw: 端口 $server_port (TCP/UDP) 已为 IP $specific_ip 开放。"
-                firewall_action_taken=true
-                restricted_ip=$specific_ip
+                if ufw allow from "$specific_ip" to any port "$server_port" proto tcp \
+                    && ufw allow from "$specific_ip" to any port "$server_port" proto udp \
+                    && ufw reload; then
+                    echo_success "ufw: 端口 $server_port (TCP/UDP) 已为 IP $specific_ip 开放。"
+                    firewall_action_taken=true
+                    restricted_ip=$specific_ip
+                else
+                    echo_error "ufw 规则应用失败，请手动检查 ufw 状态和规则。"
+                fi
             fi
             ;;
         3)
@@ -229,11 +259,14 @@ handle_firewalld() {
     case $fw_choice in
         1)
             echo_info "正在为所有 IP 开放端口 $server_port (TCP/UDP) ..."
-            firewall-cmd --permanent --add-port="$server_port/tcp"
-            firewall-cmd --permanent --add-port="$server_port/udp"
-            firewall-cmd --reload
-            echo_success "firewalld: 端口 $server_port (TCP/UDP) 已为所有 IP 开放。"
-            firewall_action_taken=true
+            if ensure_firewalld_port public "$server_port/tcp" \
+                && ensure_firewalld_port public "$server_port/udp" \
+                && firewall-cmd --reload; then
+                echo_success "firewalld: 端口 $server_port (TCP/UDP) 已为所有 IP 开放。"
+                firewall_action_taken=true
+            else
+                echo_error "firewalld 规则应用失败，请手动检查 firewalld 状态和规则。"
+            fi
             ;;
         2)
             read -rp "$(echo -e "${YELLOW}请输入允许访问的特定 IP 地址: ${NC}")" specific_ip
@@ -242,15 +275,18 @@ handle_firewalld() {
                 echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则。"
             else
                 echo_info "正在为 IP $specific_ip 开放端口 $server_port (TCP/UDP) ..."
-                firewall-cmd --permanent --new-zone=sslimit --quiet
-                firewall-cmd --permanent --zone=sslimit --add-source="$specific_ip" --quiet
-                firewall-cmd --permanent --zone=sslimit --add-port="$server_port/tcp" --quiet
-                firewall-cmd --permanent --zone=sslimit --add-port="$server_port/udp" --quiet
-                firewall-cmd --reload
-                echo_success "firewalld: 端口 $server_port (TCP/UDP) 已通过新区域 'sslimit' 为 IP $specific_ip 开放。"
-                echo_info "注意: firewalld 的 IP 限制是通过创建一个新的 zone (sslimit) 并将源 IP 和端口添加到该 zone 来实现的。"
-                firewall_action_taken=true
-                restricted_ip=$specific_ip
+                if ensure_firewalld_zone sslimit \
+                    && ensure_firewalld_source sslimit "$specific_ip" \
+                    && ensure_firewalld_port sslimit "$server_port/tcp" \
+                    && ensure_firewalld_port sslimit "$server_port/udp" \
+                    && firewall-cmd --reload; then
+                    echo_success "firewalld: 端口 $server_port (TCP/UDP) 已通过区域 'sslimit' 为 IP $specific_ip 开放。"
+                    echo_info "注意: firewalld 的 IP 限制是通过创建/复用 zone (sslimit) 并将源 IP 和端口添加到该 zone 来实现的。"
+                    firewall_action_taken=true
+                    restricted_ip=$specific_ip
+                else
+                    echo_error "firewalld 规则应用失败，请手动检查 firewalld 状态和规则。"
+                fi
             fi
             ;;
         3)
@@ -266,7 +302,7 @@ handle_firewalld() {
 
 if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
     handle_ufw
-elif command -v firewalld &> /dev/null && systemctl is-active --quiet firewalld; then
+elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
     handle_firewalld
 else
     echo_warning "未检测到 ufw 或 firewalld 防火墙，或者防火墙未激活。"
