@@ -143,19 +143,25 @@ fi
 
 echo_info "配置 Shadowsocks 服务..."
 
-# 创建配置文件
-cat > /etc/shadowsocks-libev/config.json <<EOF
-{
-    "server":"0.0.0.0",
-    "server_port":${server_port},
-    "password":"${ss_password}",
-    "timeout":300,
-    "method":"${encrypt_method}",
-    "fast_open":false,
-    "nameserver":"8.8.8.8",
-    "mode":"tcp_and_udp"
-}
-EOF
+# 使用 jq 生成配置文件，避免密码中的特殊字符破坏 JSON
+if ! jq -n \
+    --arg server "0.0.0.0" \
+    --argjson server_port "$server_port" \
+    --arg password "$ss_password" \
+    --arg method "$encrypt_method" \
+    '{
+        server: $server,
+        server_port: $server_port,
+        password: $password,
+        timeout: 300,
+        method: $method,
+        fast_open: false,
+        nameserver: "8.8.8.8",
+        mode: "tcp_and_udp"
+    }' > /etc/shadowsocks-libev/config.json; then
+    echo_error "写入配置文件失败：/etc/shadowsocks-libev/config.json"
+    exit 1
+fi
 
 echo_info "启动并设置 Shadowsocks 服务开机自启..."
 systemctl enable shadowsocks-libev
