@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Shadowsocs 安装脚本 (Debian/Ubuntu)
+# Shadowsocks 安装脚本 (Debian/Ubuntu)
 
 # 检查是否以 root 权限运行
 if [ "$(id -u)" != "0" ]; then
@@ -72,6 +72,550 @@ detect_public_ip() {
     echo "$detected_ip"
 }
 
+ensure_apt_updated() {
+    if [ "$apt_updated" = true ]; then
+        return 0
+    fi
+
+    echo_info "更新软件包列表..."
+    if ! apt update -y; then
+        echo_error "apt update 失败，请检查网络连接和 APT 源配置。"
+        return 1
+    fi
+
+    apt_updated=true
+    return 0
+}
+
+install_missing_packages() {
+    local packages=()
+    local pkg
+
+    for pkg in "$@"; do
+        if ! command -v "$pkg" &> /dev/null; then
+            packages+=("$pkg")
+        fi
+    done
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    ensure_apt_updated || return 1
+    echo_info "正在安装依赖: ${packages[*]} ..."
+    if ! apt install -y "${packages[@]}"; then
+        echo_error "安装依赖失败: ${packages[*]}"
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_download_tool() {
+    if command -v curl &> /dev/null || command -v wget &> /dev/null; then
+        return 0
+    fi
+
+    install_missing_packages curl || return 1
+    return 0
+}
+
+download_cn_ipv4_list() {
+    local output_file=$1
+
+    ensure_download_tool || return 1
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL "https://www.ipdeny.com/ipblocks/data/countries/cn.zone" -o "$output_file" || return 1
+    else
+        wget -qO "$output_file" "https://www.ipdeny.com/ipblocks/data/countries/cn.zone" || return 1
+    fi
+
+    if [ ! -s "$output_file" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_firewalld_port() {
+    local zone_name=$1
+    local port_proto=$2
+    if firewall-cmd --permanent --zone="$zone_name" --query-port="$port_proto" --quiet; then
+        return 0
+    fi
+    firewall-cmd --permanent --zone="$zone_name" --add-port="$port_proto" --quiet
+}
+
+ensure_firewalld_rich_rule() {
+    local zone_name=$1
+    local rule=$2
+    if firewall-cmd --permanent --zone="$zone_name" --query-rich-rule="$rule" --quiet; then
+        return 0
+    fi
+    firewall-cmd --permanent --zone="$zone_name" --add-rich-rule="$rule" --quiet
+}
+
+sync_firewalld_ipset_from_file() {
+    local ipset_name=$1
+    local file_path=$2
+
+    if firewall-cmd --permanent --ipset="$ipset_name" --add-entries-from-file="$file_path" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    while read -r cidr; do
+        [ -z "$cidr" ] && continue
+        firewall-cmd --permanent --ipset="$ipset_name" --add-entry="$cidr" --quiet || return 1
+    done < "$file_path"
+
+    return 0
+}
+
+apply_ufw_policy() {
+    case "$firewall_policy" in
+        all)
+            echo_info "正在配置 ufw：端口 $server_port 对所有 IP 开放 (TCP/UDP)..."
+            ufw allow "$server_port/tcp" >/dev/null || return 1
+            ufw allow "$server_port/udp" >/dev/null || return 1
+            ufw reload >/dev/null || return 1
+            firewall_action_taken=true
+            firewall_status_summary="ufw: 端口 ${server_port} 已对所有 IP 开放"
+            ;;
+        ip)
+            echo_info "正在配置 ufw：端口 $server_port 仅允许 $restricted_ip 访问 (TCP/UDP)..."
+            ufw insert 1 allow from "$restricted_ip" to any port "$server_port" proto tcp >/dev/null || return 1
+            ufw insert 2 allow from "$restricted_ip" to any port "$server_port" proto udp >/dev/null || return 1
+            ufw insert 3 deny to any port "$server_port" proto tcp >/dev/null || return 1
+            ufw insert 4 deny to any port "$server_port" proto udp >/dev/null || return 1
+            ufw reload >/dev/null || return 1
+            firewall_action_taken=true
+            firewall_status_summary="ufw: 端口 ${server_port} 仅允许 ${restricted_ip}"
+            ;;
+        block_cn)
+            local cn_file
+            cn_file=$(mktemp)
+
+            if ! download_cn_ipv4_list "$cn_file"; then
+                rm -f "$cn_file"
+                echo_error "下载大陆 IP 网段列表失败，无法应用屏蔽大陆策略。"
+                return 1
+            fi
+
+            echo_info "正在配置 ufw：屏蔽大陆访问端口 $server_port (TCP/UDP)，该步骤可能耗时较长..."
+            while read -r cidr; do
+                [ -z "$cidr" ] && continue
+                ufw insert 1 deny from "$cidr" to any port "$server_port" proto tcp >/dev/null || {
+                    rm -f "$cn_file"
+                    return 1
+                }
+                ufw insert 1 deny from "$cidr" to any port "$server_port" proto udp >/dev/null || {
+                    rm -f "$cn_file"
+                    return 1
+                }
+            done < "$cn_file"
+
+            rm -f "$cn_file"
+            ufw allow "$server_port/tcp" >/dev/null || return 1
+            ufw allow "$server_port/udp" >/dev/null || return 1
+            ufw reload >/dev/null || return 1
+            firewall_action_taken=true
+            firewall_status_summary="ufw: 端口 ${server_port} 已配置为屏蔽大陆"
+            ;;
+        *)
+            echo_error "未知的 ufw 策略：$firewall_policy"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+apply_firewalld_policy() {
+    local default_zone
+    default_zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+    if [ -z "$default_zone" ]; then
+        echo_error "无法获取 firewalld 默认 zone。"
+        return 1
+    fi
+
+    case "$firewall_policy" in
+        all)
+            echo_info "正在配置 firewalld：端口 $server_port 对所有 IP 开放 (TCP/UDP)..."
+            ensure_firewalld_port "$default_zone" "$server_port/tcp" || return 1
+            ensure_firewalld_port "$default_zone" "$server_port/udp" || return 1
+            firewall-cmd --reload >/dev/null || return 1
+            firewall_action_taken=true
+            firewall_status_summary="firewalld: 端口 ${server_port} 已对所有 IP 开放"
+            ;;
+        ip)
+            local allow_tcp_rule
+            local allow_udp_rule
+            local deny_tcp_rule
+            local deny_udp_rule
+
+            allow_tcp_rule="rule family=\"ipv4\" priority=\"-100\" source address=\"${restricted_ip}\" port port=\"${server_port}\" protocol=\"tcp\" accept"
+            allow_udp_rule="rule family=\"ipv4\" priority=\"-100\" source address=\"${restricted_ip}\" port port=\"${server_port}\" protocol=\"udp\" accept"
+            deny_tcp_rule="rule family=\"ipv4\" priority=\"100\" port port=\"${server_port}\" protocol=\"tcp\" drop"
+            deny_udp_rule="rule family=\"ipv4\" priority=\"100\" port port=\"${server_port}\" protocol=\"udp\" drop"
+
+            echo_info "正在配置 firewalld：端口 $server_port 仅允许 $restricted_ip 访问 (TCP/UDP)..."
+            ensure_firewalld_rich_rule "$default_zone" "$allow_tcp_rule" || return 1
+            ensure_firewalld_rich_rule "$default_zone" "$allow_udp_rule" || return 1
+            ensure_firewalld_rich_rule "$default_zone" "$deny_tcp_rule" || return 1
+            ensure_firewalld_rich_rule "$default_zone" "$deny_udp_rule" || return 1
+            firewall-cmd --reload >/dev/null || return 1
+            firewall_action_taken=true
+            firewall_status_summary="firewalld: 端口 ${server_port} 仅允许 ${restricted_ip}"
+            ;;
+        block_cn)
+            local ipset_name="ss_cn_block_${server_port}"
+            local cn_file
+            local block_tcp_rule
+            local block_udp_rule
+
+            cn_file=$(mktemp)
+            if ! download_cn_ipv4_list "$cn_file"; then
+                rm -f "$cn_file"
+                echo_error "下载大陆 IP 网段列表失败，无法应用屏蔽大陆策略。"
+                return 1
+            fi
+
+            echo_info "正在配置 firewalld：屏蔽大陆访问端口 $server_port (TCP/UDP)..."
+            if firewall-cmd --permanent --get-ipsets | tr ' ' '\n' | grep -qx "$ipset_name"; then
+                firewall-cmd --permanent --delete-ipset="$ipset_name" >/dev/null || {
+                    rm -f "$cn_file"
+                    return 1
+                }
+            fi
+
+            firewall-cmd --permanent --new-ipset="$ipset_name" --type=hash:net >/dev/null || {
+                rm -f "$cn_file"
+                return 1
+            }
+
+            sync_firewalld_ipset_from_file "$ipset_name" "$cn_file" || {
+                rm -f "$cn_file"
+                return 1
+            }
+            rm -f "$cn_file"
+
+            ensure_firewalld_port "$default_zone" "$server_port/tcp" || return 1
+            ensure_firewalld_port "$default_zone" "$server_port/udp" || return 1
+
+            block_tcp_rule="rule family=\"ipv4\" priority=\"-50\" source ipset=\"${ipset_name}\" port port=\"${server_port}\" protocol=\"tcp\" drop"
+            block_udp_rule="rule family=\"ipv4\" priority=\"-50\" source ipset=\"${ipset_name}\" port port=\"${server_port}\" protocol=\"udp\" drop"
+            ensure_firewalld_rich_rule "$default_zone" "$block_tcp_rule" || return 1
+            ensure_firewalld_rich_rule "$default_zone" "$block_udp_rule" || return 1
+
+            firewall-cmd --reload >/dev/null || return 1
+            firewall_action_taken=true
+            firewall_status_summary="firewalld: 端口 ${server_port} 已配置为屏蔽大陆"
+            ;;
+        *)
+            echo_error "未知的 firewalld 策略：$firewall_policy"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+apply_firewall_plan() {
+    if [ "$configure_firewall" != true ]; then
+        firewall_action_taken=false
+        firewall_status_summary="未自动配置"
+        return 0
+    fi
+
+    ensure_apt_updated || return 1
+
+    case "$firewall_backend" in
+        ufw)
+            if [ "$install_firewall_package" = true ]; then
+                echo_info "正在安装 ufw ..."
+                apt install -y ufw || return 1
+            fi
+
+            if ! command -v ufw &> /dev/null; then
+                echo_error "未找到 ufw，无法应用防火墙策略。"
+                return 1
+            fi
+
+            if [ "$install_firewall_package" = true ] && [ "$firewall_is_existing" = false ]; then
+                echo_info "新安装 ufw：保持其他端口开放，仅处理端口 $server_port。"
+                ufw default allow incoming >/dev/null || return 1
+                ufw default allow outgoing >/dev/null || return 1
+            fi
+
+            if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+                echo_info "启用 ufw ..."
+                ufw --force enable >/dev/null || return 1
+            fi
+
+            apply_ufw_policy || return 1
+            ;;
+        firewalld)
+            if [ "$install_firewall_package" = true ]; then
+                echo_info "正在安装 firewalld ..."
+                apt install -y firewalld || return 1
+            fi
+
+            if ! command -v firewall-cmd &> /dev/null; then
+                echo_error "未找到 firewalld，无法应用防火墙策略。"
+                return 1
+            fi
+
+            if ! systemctl is-active --quiet firewalld; then
+                echo_info "启动 firewalld ..."
+                systemctl enable --now firewalld || return 1
+            fi
+
+            if [ "$install_firewall_package" = true ] && [ "$firewall_is_existing" = false ]; then
+                local default_zone
+                default_zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+                if [ -z "$default_zone" ]; then
+                    echo_error "无法获取 firewalld 默认 zone。"
+                    return 1
+                fi
+
+                echo_info "新安装 firewalld：保持其他端口开放，仅处理端口 $server_port。"
+                firewall-cmd --permanent --zone="$default_zone" --set-target=ACCEPT >/dev/null || return 1
+                firewall-cmd --zone="$default_zone" --set-target=ACCEPT >/dev/null || return 1
+            fi
+
+            apply_firewalld_policy || return 1
+            ;;
+        *)
+            echo_error "未知的防火墙后端：$firewall_backend"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+select_firewall_plan() {
+    local have_ufw=false
+    local have_firewalld=false
+    local default_backend_choice=1
+
+    read -rp "$(echo -e "${YELLOW}是否在安装前配置防火墙？ (y/N): ${NC}")" firewall_setup_choice
+    if [[ "$firewall_setup_choice" != "y" && "$firewall_setup_choice" != "Y" ]]; then
+        configure_firewall=false
+        firewall_backend="none"
+        firewall_policy="none"
+        firewall_plan_summary="不自动配置"
+        return 0
+    fi
+
+    configure_firewall=true
+
+    if command -v ufw &> /dev/null; then
+        have_ufw=true
+    fi
+    if command -v firewall-cmd &> /dev/null; then
+        have_firewalld=true
+    fi
+
+    if [ "$have_ufw" = true ] && [ "$have_firewalld" = true ]; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            default_backend_choice=1
+        elif systemctl is-active --quiet firewalld; then
+            default_backend_choice=2
+        else
+            default_backend_choice=1
+        fi
+
+        echo_info "检测到系统已安装多种防火墙，请选择使用:"
+        echo -e "  1) ufw ${BLUE}$(if [ "$default_backend_choice" -eq 1 ]; then echo "(默认)"; fi)${NC}"
+        echo -e "  2) firewalld ${BLUE}$(if [ "$default_backend_choice" -eq 2 ]; then echo "(默认)"; fi)${NC}"
+        read -rp "$(echo -e "${YELLOW}请输入选项 (1/2，默认 ${default_backend_choice}): ${NC}")" backend_choice
+        backend_choice=${backend_choice:-$default_backend_choice}
+
+        case "$backend_choice" in
+            1)
+                firewall_backend="ufw"
+                ;;
+            2)
+                firewall_backend="firewalld"
+                ;;
+            *)
+                echo_warning "无效选择，使用默认防火墙后端。"
+                if [ "$default_backend_choice" -eq 1 ]; then
+                    firewall_backend="ufw"
+                else
+                    firewall_backend="firewalld"
+                fi
+                ;;
+        esac
+
+        firewall_is_existing=true
+        install_firewall_package=false
+    elif [ "$have_ufw" = true ]; then
+        firewall_backend="ufw"
+        firewall_is_existing=true
+        install_firewall_package=false
+        echo_info "检测到已安装 ufw，将在现有规则基础上修改。"
+    elif [ "$have_firewalld" = true ]; then
+        firewall_backend="firewalld"
+        firewall_is_existing=true
+        install_firewall_package=false
+        echo_info "检测到已安装 firewalld，将在现有规则基础上修改。"
+    else
+        firewall_is_existing=false
+        install_firewall_package=true
+
+        echo_warning "未检测到 ufw 或 firewalld。"
+        echo_info "请选择安装防火墙软件（默认 ufw）："
+        echo -e "  1) ufw ${BLUE}(默认)${NC}"
+        echo -e "  2) firewalld"
+        echo -e "  3) 不配置防火墙"
+        read -rp "$(echo -e "${YELLOW}请输入选项 (1/2/3，默认 1): ${NC}")" install_fw_choice
+        install_fw_choice=${install_fw_choice:-1}
+
+        case "$install_fw_choice" in
+            1)
+                firewall_backend="ufw"
+                ;;
+            2)
+                firewall_backend="firewalld"
+                ;;
+            3)
+                configure_firewall=false
+                firewall_backend="none"
+                firewall_policy="none"
+                firewall_plan_summary="不自动配置"
+                install_firewall_package=false
+                return 0
+                ;;
+            *)
+                echo_warning "无效选择，默认安装 ufw。"
+                firewall_backend="ufw"
+                ;;
+        esac
+
+        echo_info "将安装 ${firewall_backend} 并保持其他端口开放，仅处理端口 $server_port。"
+    fi
+
+    echo_info "请选择防火墙策略:"
+    echo -e "  1) ${GREEN}对所有 IP 开放${NC}"
+    echo -e "  2) ${YELLOW}仅对特定 IP 开放${NC}"
+    echo -e "  3) ${RED}屏蔽大陆${NC}"
+    read -rp "$(echo -e "${YELLOW}请输入选项 (1/2/3，默认 1): ${NC}")" policy_choice
+    policy_choice=${policy_choice:-1}
+
+    case "$policy_choice" in
+        1)
+            firewall_policy="all"
+            firewall_plan_summary="对所有 IP 开放"
+            ;;
+        2)
+            firewall_policy="ip"
+            read -rp "$(echo -e "${YELLOW}请输入允许访问的特定 IPv4 地址: ${NC}")" restricted_ip
+            if [ -z "$restricted_ip" ]; then
+                echo_error "特定 IP 不能为空。"
+                return 1
+            fi
+            if ! is_valid_ipv4 "$restricted_ip"; then
+                echo_error "无效的 IPv4 地址：${restricted_ip}"
+                return 1
+            fi
+            firewall_plan_summary="仅允许 ${restricted_ip}"
+            ;;
+        3)
+            firewall_policy="block_cn"
+            firewall_plan_summary="屏蔽大陆"
+            ;;
+        *)
+            echo_warning "无效选择，将默认对所有 IP 开放。"
+            firewall_policy="all"
+            firewall_plan_summary="对所有 IP 开放"
+            ;;
+    esac
+
+    return 0
+}
+
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    else
+        echo_error "无法检测到操作系统发行版。"
+        return 1
+    fi
+
+    if [ "$OS" != "debian" ] && [ "$OS" != "ubuntu" ]; then
+        echo_error "不支持的操作系统: $OS。此脚本仅支持 Debian 和 Ubuntu。"
+        return 1
+    fi
+
+    return 0
+}
+
+install_shadowsocks() {
+    echo_info "开始安装 Shadowsocks (libsodium)..."
+
+    install_missing_packages curl sudo jq qrencode || return 1
+
+    echo_info "正在从 APT 仓库安装 shadowsocks-libev..."
+    if ! apt install -y shadowsocks-libev; then
+        echo_error "安装 shadowsocks-libev 失败。请尝试手动安装或检查软件源。"
+        return 1
+    fi
+
+    echo_info "配置 Shadowsocks 服务..."
+
+    # 使用 jq 生成配置文件，避免密码中的特殊字符破坏 JSON
+    if ! jq -n \
+        --arg server "0.0.0.0" \
+        --argjson server_port "$server_port" \
+        --arg password "$ss_password" \
+        --arg method "$encrypt_method" \
+        '{
+            server: $server,
+            server_port: $server_port,
+            password: $password,
+            timeout: 300,
+            method: $method,
+            fast_open: false,
+            nameserver: "8.8.8.8",
+            mode: "tcp_and_udp"
+        }' > /etc/shadowsocks-libev/config.json; then
+        echo_error "写入配置文件失败：/etc/shadowsocks-libev/config.json"
+        return 1
+    fi
+
+    echo_info "启动并设置 Shadowsocks 服务开机自启..."
+    systemctl enable shadowsocks-libev >/dev/null
+    systemctl restart shadowsocks-libev
+
+    sleep 2
+    if systemctl is-active --quiet shadowsocks-libev; then
+        echo_success "Shadowsocks 服务已成功启动！"
+        return 0
+    fi
+
+    echo_error "Shadowsocks 服务启动失败。请检查日志：journalctl -u shadowsocks-libev"
+    echo_error "配置文件路径: /etc/shadowsocks-libev/config.json"
+    return 1
+}
+
+apt_updated=false
+OS=""
+
+# 防火墙计划变量
+configure_firewall=false
+firewall_backend="none"
+firewall_policy="none"
+firewall_plan_summary="不自动配置"
+firewall_status_summary="未自动配置"
+firewall_is_existing=false
+install_firewall_package=false
+firewall_action_taken=false
+restricted_ip=""
+
 # 交互式获取配置信息
 echo_info "开始配置 Shadowsocks 服务..."
 
@@ -114,7 +658,6 @@ fi
 default_port=8388
 read -rp "$(echo -e "${YELLOW}请输入 Shadowsocks 服务端口号 (默认: ${default_port}): ${NC}")" server_port
 server_port=${server_port:-$default_port}
-# 验证端口号是否为数字且在有效范围内
 if ! [[ "$server_port" =~ ^[0-9]+$ ]] || [ "$server_port" -lt 1 ] || [ "$server_port" -gt 65535 ]; then
     echo_error "无效的端口号：${server_port}。请输入 1-65535 之间的数字。"
     exit 1
@@ -151,10 +694,15 @@ read -rp "$(echo -e "${YELLOW}请输入选项数字 (默认: 1 for ${default_enc
 encrypt_choice=${encrypt_choice:-1}
 
 if [[ "$encrypt_choice" =~ ^[0-9]+$ ]] && [ "$encrypt_choice" -ge 1 ] && [ "$encrypt_choice" -le "${#encrypt_methods[@]}" ]; then
-    encrypt_method=${encrypt_methods[$(($encrypt_choice-1))]}
+    encrypt_method=${encrypt_methods[$((encrypt_choice-1))]}
 else
     echo_warning "无效的选择，将使用默认加密方法: ${default_encrypt_method}"
     encrypt_method=$default_encrypt_method
+fi
+
+# 防火墙配置计划
+if ! select_firewall_plan; then
+    exit 1
 fi
 
 echo ""
@@ -163,237 +711,37 @@ echo -e "  ${YELLOW}服务器 IP:${NC}   $server_ip"
 echo -e "  ${YELLOW}服务器端口:${NC} $server_port"
 echo -e "  ${YELLOW}密码:${NC}       $ss_password"
 echo -e "  ${YELLOW}加密方法:${NC}   $encrypt_method"
+if [ "$configure_firewall" = true ]; then
+    echo -e "  ${YELLOW}防火墙后端:${NC} $firewall_backend $(if [ "$firewall_is_existing" = true ]; then echo "(已有)"; else echo "(新安装)"; fi)"
+    echo -e "  ${YELLOW}防火墙策略:${NC} $firewall_plan_summary"
+else
+    echo -e "  ${YELLOW}防火墙策略:${NC} 不自动配置"
+fi
 echo ""
 
-read -rp "$(echo -e "${YELLOW}确认以上配置并开始安装吗？ (y/N): ${NC}")" confirm_install
+read -rp "$(echo -e "${YELLOW}确认以上配置并开始执行吗？ (y/N): ${NC}")" confirm_install
 if [[ "$confirm_install" != "y" && "$confirm_install" != "Y" ]]; then
     echo_info "安装已取消。"
     exit 0
 fi
 
-echo_info "开始安装 Shadowsocks (libsodium)..."
+detect_os || exit 1
+ensure_apt_updated || exit 1
 
-# 更新软件包列表并安装依赖
-if ! apt update -y; then
-    echo_error "apt update 失败，请检查网络连接和 APT 源配置。"
-    exit 1
-fi
-if ! command -v curl &> /dev/null || ! command -v sudo &> /dev/null || ! command -v jq &> /dev/null || ! command -v qrencode &> /dev/null; then
-    echo_info "正在安装必要的工具: curl, sudo, jq, qrencode..."
-    apt install -y curl sudo jq qrencode
-    if [ $? -ne 0 ]; then
-        echo_error "安装依赖失败，请检查网络连接或手动安装。"
-        exit 1
-    fi
-fi
-
-# 安装 shadowsocks-libev
-# 检查发行版
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS=$ID
-else
-    echo_error "无法检测到操作系统发行版。"
-    exit 1
-fi
-
-if [ "$OS" == "debian" ] || [ "$OS" == "ubuntu" ]; then
-    echo_info "正在从 APT 仓库安装 shadowsocks-libev..."
-    apt install -y shadowsocks-libev
-    if [ $? -ne 0 ]; then
-        echo_error "安装 shadowsocks-libev 失败。请尝试手动安装或检查软件源。"
+# 按要求：先执行防火墙策略，再安装 Shadowsocks
+if [ "$configure_firewall" = true ]; then
+    echo_info "先应用防火墙策略..."
+    if ! apply_firewall_plan; then
+        echo_error "防火墙策略执行失败，已停止安装 Shadowsocks。"
         exit 1
     fi
 else
-    echo_error "不支持的操作系统: $OS。此脚本仅支持 Debian 和 Ubuntu。"
+    firewall_status_summary="未自动配置"
+fi
+
+if ! install_shadowsocks; then
     exit 1
 fi
-
-echo_info "配置 Shadowsocks 服务..."
-
-# 使用 jq 生成配置文件，避免密码中的特殊字符破坏 JSON
-if ! jq -n \
-    --arg server "0.0.0.0" \
-    --argjson server_port "$server_port" \
-    --arg password "$ss_password" \
-    --arg method "$encrypt_method" \
-    '{
-        server: $server,
-        server_port: $server_port,
-        password: $password,
-        timeout: 300,
-        method: $method,
-        fast_open: false,
-        nameserver: "8.8.8.8",
-        mode: "tcp_and_udp"
-    }' > /etc/shadowsocks-libev/config.json; then
-    echo_error "写入配置文件失败：/etc/shadowsocks-libev/config.json"
-    exit 1
-fi
-
-echo_info "启动并设置 Shadowsocks 服务开机自启..."
-systemctl enable shadowsocks-libev
-systemctl restart shadowsocks-libev
-
-# 检查服务状态
-sleep 2 # 等待服务启动
-if systemctl is-active --quiet shadowsocks-libev; then
-    echo_success "Shadowsocks 服务已成功启动！"
-else
-    echo_error "Shadowsocks 服务启动失败。请检查日志：journalctl -u shadowsocks-libev"
-    echo_error "配置文件路径: /etc/shadowsocks-libev/config.json"
-    exit 1
-fi
-
-# --- 防火墙设置修改开始 ---
-firewall_action_taken=false
-restricted_ip=""
-
-ensure_firewalld_zone() {
-    local zone_name=$1
-    if firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "$zone_name"; then
-        return 0
-    fi
-    firewall-cmd --permanent --new-zone="$zone_name" --quiet
-}
-
-ensure_firewalld_source() {
-    local zone_name=$1
-    local source_ip=$2
-    if firewall-cmd --permanent --zone="$zone_name" --query-source="$source_ip" --quiet; then
-        return 0
-    fi
-    firewall-cmd --permanent --zone="$zone_name" --add-source="$source_ip" --quiet
-}
-
-ensure_firewalld_port() {
-    local zone_name=$1
-    local port_proto=$2
-    if firewall-cmd --permanent --zone="$zone_name" --query-port="$port_proto" --quiet; then
-        return 0
-    fi
-    firewall-cmd --permanent --zone="$zone_name" --add-port="$port_proto" --quiet
-}
-
-handle_ufw() {
-    echo_info "检测到 ufw 防火墙。请选择如何开放端口 $server_port:"
-    echo -e "  1) ${GREEN}为所有 IP 开放端口 (推荐，如果服务器公网访问)${NC}"
-    echo -e "  2) ${YELLOW}仅为特定 IP 开放端口 (更安全)${NC}"
-    echo -e "  3) ${RED}不自动开放端口 (您需要手动配置)${NC}"
-    read -rp "$(echo -e "${YELLOW}请输入选项 (1/2/3，默认 1): ${NC}")" fw_choice
-    fw_choice=${fw_choice:-1}
-
-    case $fw_choice in
-        1)
-            echo_info "正在为所有 IP 开放端口 $server_port (TCP/UDP) ..."
-            if ufw allow "$server_port/tcp" && ufw allow "$server_port/udp" && ufw reload; then
-                echo_success "ufw: 端口 $server_port (TCP/UDP) 已为所有 IP 开放。"
-                firewall_action_taken=true
-            else
-                echo_error "ufw 规则应用失败，请手动检查 ufw 状态和规则。"
-            fi
-            ;;
-        2)
-            read -rp "$(echo -e "${YELLOW}请输入允许访问的特定 IP 地址: ${NC}")" specific_ip
-            if [ -z "$specific_ip" ]; then
-                echo_warning "未输入 IP 地址，将不开放端口。"
-                echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则。"
-            elif ! is_valid_ipv4 "$specific_ip"; then
-                echo_error "无效的 IPv4 地址：${specific_ip}。将不自动开放端口。"
-            else
-                echo_info "正在为 IP $specific_ip 开放端口 $server_port (TCP/UDP) ..."
-                if ufw allow from "$specific_ip" to any port "$server_port" proto tcp \
-                    && ufw allow from "$specific_ip" to any port "$server_port" proto udp \
-                    && ufw reload; then
-                    echo_success "ufw: 端口 $server_port (TCP/UDP) 已为 IP $specific_ip 开放。"
-                    firewall_action_taken=true
-                    restricted_ip=$specific_ip
-                else
-                    echo_error "ufw 规则应用失败，请手动检查 ufw 状态和规则。"
-                fi
-            fi
-            ;;
-        3)
-            echo_warning "您选择了不自动开放端口。"
-            echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则以允许连接。"
-            ;;
-        *)
-            echo_warning "无效的选择。将不自动开放端口。"
-            echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则以允许连接。"
-            ;;
-    esac
-}
-
-handle_firewalld() {
-    echo_info "检测到 firewalld 防火墙。请选择如何开放端口 $server_port:"
-    echo -e "  1) ${GREEN}为所有 IP 开放端口 (推荐，如果服务器公网访问)${NC}"
-    echo -e "  2) ${YELLOW}仅为特定 IP 开放端口 (更安全)${NC}"
-    echo -e "  3) ${RED}不自动开放端口 (您需要手动配置)${NC}"
-    read -rp "$(echo -e "${YELLOW}请输入选项 (1/2/3，默认 1): ${NC}")" fw_choice
-    fw_choice=${fw_choice:-1}
-
-    case $fw_choice in
-        1)
-            echo_info "正在为所有 IP 开放端口 $server_port (TCP/UDP) ..."
-            local default_zone
-            default_zone=$(firewall-cmd --get-default-zone 2>/dev/null)
-            if [ -z "$default_zone" ]; then
-                echo_error "无法获取 firewalld 默认 zone。"
-                return 1
-            fi
-            if ensure_firewalld_port "$default_zone" "$server_port/tcp" \
-                && ensure_firewalld_port "$default_zone" "$server_port/udp" \
-                && firewall-cmd --reload; then
-                echo_success "firewalld: 端口 $server_port (TCP/UDP) 已在默认 zone (${default_zone}) 开放。"
-                firewall_action_taken=true
-            else
-                echo_error "firewalld 规则应用失败，请手动检查 firewalld 状态和规则。"
-            fi
-            ;;
-        2)
-            read -rp "$(echo -e "${YELLOW}请输入允许访问的特定 IP 地址: ${NC}")" specific_ip
-            if [ -z "$specific_ip" ]; then
-                echo_warning "未输入 IP 地址，将不开放端口。"
-                echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则。"
-            elif ! is_valid_ipv4 "$specific_ip"; then
-                echo_error "无效的 IPv4 地址：${specific_ip}。将不自动开放端口。"
-            else
-                echo_info "正在为 IP $specific_ip 开放端口 $server_port (TCP/UDP) ..."
-                if ensure_firewalld_zone sslimit \
-                    && ensure_firewalld_source sslimit "$specific_ip" \
-                    && ensure_firewalld_port sslimit "$server_port/tcp" \
-                    && ensure_firewalld_port sslimit "$server_port/udp" \
-                    && firewall-cmd --reload; then
-                    echo_success "firewalld: 端口 $server_port (TCP/UDP) 已通过区域 'sslimit' 为 IP $specific_ip 开放。"
-                    echo_info "注意: firewalld 的 IP 限制是通过创建/复用 zone (sslimit) 并将源 IP 和端口添加到该 zone 来实现的。"
-                    firewall_action_taken=true
-                    restricted_ip=$specific_ip
-                else
-                    echo_error "firewalld 规则应用失败，请手动检查 firewalld 状态和规则。"
-                fi
-            fi
-            ;;
-        3)
-            echo_warning "您选择了不自动开放端口。"
-            echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则以允许连接。"
-            ;;
-        *)
-            echo_warning "无效的选择。将不自动开放端口。"
-            echo_warning "请确保手动为端口 $server_port (TCP/UDP) 配置防火墙规则以允许连接。"
-            ;;
-    esac
-}
-
-if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-    handle_ufw
-elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
-    handle_firewalld
-else
-    echo_warning "未检测到 ufw 或 firewalld 防火墙，或者防火墙未激活。"
-    echo_warning "如果您的服务器有其他防火墙，请确保手动开放端口 $server_port (TCP 和 UDP) 以允许外部连接。"
-fi
-# --- 防火墙设置修改结束 ---
-
 
 # 生成 ss:// 链接
 encoded_password=$(urlencode "$ss_password")
@@ -411,12 +759,10 @@ echo -e "  ${YELLOW}服务器地址 (Server IP):${NC}  ${server_ip}"
 echo -e "  ${YELLOW}服务器端口 (Server Port):${NC} ${server_port}"
 echo -e "  ${YELLOW}密码 (Password):${NC}        ${ss_password}"
 echo -e "  ${YELLOW}加密方法 (Encryption):${NC}  ${encrypt_method}"
-if [ "$firewall_action_taken" = true ] && [ -n "$restricted_ip" ]; then
-    echo -e "  ${YELLOW}防火墙:${NC}         端口 ${server_port} 已为特定 IP ${GREEN}${restricted_ip}${NC} 开放"
-elif [ "$firewall_action_taken" = true ]; then
-    echo -e "  ${YELLOW}防火墙:${NC}         端口 ${server_port} 已为 ${GREEN}所有 IP${NC} 开放"
+if [ "$firewall_action_taken" = true ]; then
+    echo -e "  ${YELLOW}防火墙:${NC}         ${GREEN}${firewall_status_summary}${NC}"
 else
-    echo -e "  ${YELLOW}防火墙:${NC}         ${RED}端口 ${server_port} 未自动配置，请手动检查或开放${NC}"
+    echo -e "  ${YELLOW}防火墙:${NC}         ${RED}${firewall_status_summary}${NC}"
 fi
 echo "---------------------------------------------------"
 echo -e "${GREEN}SS 链接 (明文):${NC}"
@@ -425,12 +771,13 @@ echo "---------------------------------------------------"
 echo -e "${GREEN}SS 链接 (Base64):${NC}"
 echo -e "  ${BLUE}${ss_link_base64}${NC}"
 echo "---------------------------------------------------"
-# 生成二维码 (如果 qrencode 已安装)
+
 if command -v qrencode &> /dev/null; then
     echo -e "${GREEN}SS 链接二维码 (扫描导入):${NC}"
     qrencode -t ansiutf8 "${ss_link_base64}"
     echo "---------------------------------------------------"
 fi
+
 echo -e "${GREEN}Clash (YAML) 配置片段:${NC}"
 echo "   proxies:"
 echo "    - name: \"SS-$(hostname)-${server_port}\" # 您可以自定义名称"
@@ -440,14 +787,10 @@ echo "      port: ${server_port}"
 echo "      password: ${clash_password_json}"
 echo "      cipher: ${encrypt_method}"
 echo "      udp: true # 根据您的 Shadowsocks 服务端配置调整，这里默认开启 UDP"
-# 如果需要，可以添加更多 Clash 支持的 Shadowsocks 参数，例如：
-# echo "      # plugin: obfs" # 如果你使用了 obfs 插件
-# echo "      # plugin-opts:"
-# echo "      #   mode: http"
-# echo "      #   host: example.com"
 echo "==================================================="
+
 echo_info "请妥善保管您的配置信息。"
-if ! $firewall_action_taken; then
+if [ "$firewall_action_taken" != true ]; then
     echo_warning "请再次注意：防火墙端口 ${server_port} 未自动配置，您可能需要手动开放才能连接。"
 fi
 echo_info "如果服务无法连接，请检查防火墙设置以及服务日志: journalctl -u shadowsocks-libev"
