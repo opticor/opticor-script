@@ -172,6 +172,18 @@ sync_firewalld_ipset_from_file() {
     return 0
 }
 
+ufw_add_rule_front() {
+    if ufw prepend "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ufw insert 1 "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
 apply_ufw_policy() {
     case "$firewall_policy" in
         all)
@@ -184,10 +196,25 @@ apply_ufw_policy() {
             ;;
         ip)
             echo_info "正在配置 ufw：端口 $server_port 仅允许 $restricted_ip 访问 (TCP/UDP)..."
-            ufw insert 1 allow from "$restricted_ip" to any port "$server_port" proto tcp >/dev/null || return 1
-            ufw insert 2 allow from "$restricted_ip" to any port "$server_port" proto udp >/dev/null || return 1
-            ufw insert 3 deny to any port "$server_port" proto tcp >/dev/null || return 1
-            ufw insert 4 deny to any port "$server_port" proto udp >/dev/null || return 1
+
+            # 先前插 deny，再前插 allow，确保 allow 在 deny 之前命中
+            ufw_add_rule_front deny to any port "$server_port" proto tcp || {
+                echo_error "当前 ufw 不支持前插规则（prepend/insert），无法安全应用“仅特定 IP 开放”策略。"
+                return 1
+            }
+            ufw_add_rule_front deny to any port "$server_port" proto udp || {
+                echo_error "当前 ufw 不支持前插规则（prepend/insert），无法安全应用“仅特定 IP 开放”策略。"
+                return 1
+            }
+            ufw_add_rule_front allow from "$restricted_ip" to any port "$server_port" proto tcp || {
+                echo_error "当前 ufw 不支持前插规则（prepend/insert），无法安全应用“仅特定 IP 开放”策略。"
+                return 1
+            }
+            ufw_add_rule_front allow from "$restricted_ip" to any port "$server_port" proto udp || {
+                echo_error "当前 ufw 不支持前插规则（prepend/insert），无法安全应用“仅特定 IP 开放”策略。"
+                return 1
+            }
+
             ufw reload >/dev/null || return 1
             firewall_action_taken=true
             firewall_status_summary="ufw: 端口 ${server_port} 仅允许 ${restricted_ip}"
@@ -203,21 +230,32 @@ apply_ufw_policy() {
             fi
 
             echo_info "正在配置 ufw：屏蔽大陆访问端口 $server_port (TCP/UDP)，该步骤可能耗时较长..."
+
+            # 先追加 allow，再把大陆 deny 前插到最前，确保 deny 优先
+            ufw allow "$server_port/tcp" >/dev/null || {
+                rm -f "$cn_file"
+                return 1
+            }
+            ufw allow "$server_port/udp" >/dev/null || {
+                rm -f "$cn_file"
+                return 1
+            }
+
             while read -r cidr; do
                 [ -z "$cidr" ] && continue
-                ufw insert 1 deny from "$cidr" to any port "$server_port" proto tcp >/dev/null || {
+                ufw_add_rule_front deny from "$cidr" to any port "$server_port" proto tcp || {
                     rm -f "$cn_file"
+                    echo_error "当前 ufw 不支持前插规则（prepend/insert），无法安全应用“屏蔽大陆”策略。"
                     return 1
                 }
-                ufw insert 1 deny from "$cidr" to any port "$server_port" proto udp >/dev/null || {
+                ufw_add_rule_front deny from "$cidr" to any port "$server_port" proto udp || {
                     rm -f "$cn_file"
+                    echo_error "当前 ufw 不支持前插规则（prepend/insert），无法安全应用“屏蔽大陆”策略。"
                     return 1
                 }
             done < "$cn_file"
 
             rm -f "$cn_file"
-            ufw allow "$server_port/tcp" >/dev/null || return 1
-            ufw allow "$server_port/udp" >/dev/null || return 1
             ufw reload >/dev/null || return 1
             firewall_action_taken=true
             firewall_status_summary="ufw: 端口 ${server_port} 已配置为屏蔽大陆"
@@ -230,7 +268,6 @@ apply_ufw_policy() {
 
     return 0
 }
-
 apply_firewalld_policy() {
     local default_zone
     default_zone=$(firewall-cmd --get-default-zone 2>/dev/null)
@@ -796,3 +833,4 @@ fi
 echo_info "如果服务无法连接，请检查防火墙设置以及服务日志: journalctl -u shadowsocks-libev"
 
 exit 0
+
