@@ -1221,9 +1221,11 @@ validate_config() {
 
     # 基本检查
     local bind_count
-    bind_count=$(grep -cE '^bind' "$SMARTDNS_CONF" 2>/dev/null || echo 0)
+    bind_count=$(grep -cE '^bind' "$SMARTDNS_CONF" 2>/dev/null || true)
+    bind_count="${bind_count:-0}"
     local server_count
-    server_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)\b)' "$SMARTDNS_CONF" 2>/dev/null || echo 0)
+    server_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)\b)' "$SMARTDNS_CONF" 2>/dev/null || true)
+    server_count="${server_count:-0}"
 
     if [[ "$bind_count" -eq 0 ]]; then
         print_error "配置文件中没有 bind 指令"
@@ -1391,7 +1393,8 @@ show_status() {
         local listen_port
         listen_port=$(grep -E '^bind' "$SMARTDNS_CONF" | head -1 | grep -oE '[0-9]+$')
         local upstream_count
-        upstream_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)\b)' "$SMARTDNS_CONF" 2>/dev/null || echo 0)
+        upstream_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)\b)' "$SMARTDNS_CONF" 2>/dev/null || true)
+        upstream_count="${upstream_count:-0}"
         local cache_size
         cache_size=$(grep -E '^cache-size' "$SMARTDNS_CONF" | awk '{print $2}')
 
@@ -1688,7 +1691,8 @@ view_upstream_dns() {
     plain_dns=$(grep -E '^[[:space:]]*server[[:space:]]+' "$SMARTDNS_CONF" 2>/dev/null || true)
     https_dns=$(grep -E '^[[:space:]]*server-https[[:space:]]+' "$SMARTDNS_CONF" 2>/dev/null || true)
     tls_dns=$(grep -E '^[[:space:]]*server-tls[[:space:]]+' "$SMARTDNS_CONF" 2>/dev/null || true)
-    total=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)[[:space:]])' "$SMARTDNS_CONF" 2>/dev/null || echo 0)
+    total=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)[[:space:]])' "$SMARTDNS_CONF" 2>/dev/null || true)
+    total="${total:-0}"
 
     if [[ "$total" -eq 0 ]]; then
         print_warn "未找到有效的上游 DNS 配置"
@@ -1745,8 +1749,10 @@ toggle_encrypted_dns() {
     echo ""
     echo "当前加密 DNS 状态:"
     local doh_count dot_count
-    doh_count=$(grep -c '^server-https' "$SMARTDNS_CONF" 2>/dev/null || echo 0)
-    dot_count=$(grep -c '^server-tls' "$SMARTDNS_CONF" 2>/dev/null || echo 0)
+    doh_count=$(grep -c '^server-https' "$SMARTDNS_CONF" 2>/dev/null || true)
+    doh_count="${doh_count:-0}"
+    dot_count=$(grep -c '^server-tls' "$SMARTDNS_CONF" 2>/dev/null || true)
+    dot_count="${dot_count:-0}"
     echo "  DOH 服务器: ${doh_count} 个"
     echo "  DOT 服务器: ${dot_count} 个"
     echo ""
