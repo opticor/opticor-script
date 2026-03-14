@@ -1224,7 +1224,7 @@ validate_config() {
     bind_count=$(grep -cE '^bind' "$SMARTDNS_CONF" 2>/dev/null || true)
     bind_count="${bind_count:-0}"
     local server_count
-    server_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)\b)' "$SMARTDNS_CONF" 2>/dev/null || true)
+    server_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)($|[[:space:]]))' "$SMARTDNS_CONF" 2>/dev/null || true)
     server_count="${server_count:-0}"
 
     if [[ "$bind_count" -eq 0 ]]; then
@@ -1393,7 +1393,7 @@ show_status() {
         local listen_port
         listen_port=$(grep -E '^bind' "$SMARTDNS_CONF" | head -1 | grep -oE '[0-9]+$')
         local upstream_count
-        upstream_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)\b)' "$SMARTDNS_CONF" 2>/dev/null || true)
+        upstream_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)($|[[:space:]]))' "$SMARTDNS_CONF" 2>/dev/null || true)
         upstream_count="${upstream_count:-0}"
         local cache_size
         cache_size=$(grep -E '^cache-size' "$SMARTDNS_CONF" | awk '{print $2}')
