@@ -32,17 +32,45 @@ echo_error() {
     echo -e "${RED}[错误]${NC} $1"
 }
 
+is_private_ipv4() {
+    local ip=$1
+    [[ "$ip" =~ ^10\. ]] \
+        || [[ "$ip" =~ ^127\. ]] \
+        || [[ "$ip" =~ ^192\.168\. ]] \
+        || [[ "$ip" =~ ^169\.254\. ]] \
+        || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] \
+        || [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]
+}
+
+detect_public_ip() {
+    local detected_ip=""
+    if command -v curl &> /dev/null; then
+        detected_ip=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [ -z "$detected_ip" ] && command -v wget &> /dev/null; then
+        detected_ip=$(wget -qO- --timeout=4 https://api.ipify.org 2>/dev/null || true)
+    fi
+    echo "$detected_ip"
+}
+
 # 交互式获取配置信息
 echo_info "开始配置 Shadowsocks 服务..."
 
-# 获取服务器 IP 地址 (尝试自动获取，否则提示输入)
-server_ip=$(hostname -I | awk '{print $1}')
+# 获取服务器 IP 地址 (优先公网 IP，失败则使用本机 IP 并提示确认)
+server_ip=$(detect_public_ip)
+if [ -z "$server_ip" ]; then
+    server_ip=$(hostname -I | awk '{print $1}')
+fi
 if [ -z "$server_ip" ]; then
     read -rp "$(echo -e "${YELLOW}请输入您的服务器公网 IP 地址: ${NC}")" server_ip
     if [ -z "$server_ip" ]; then
         echo_error "服务器 IP 地址不能为空！"
         exit 1
     fi
+elif is_private_ipv4 "$server_ip"; then
+    echo_warning "自动检测到的 IP (${server_ip}) 可能是内网地址。"
+    read -rp "$(echo -e "${YELLOW}请输入服务器公网 IP 地址 (回车保留当前值): ${NC}")" input_server_ip
+    server_ip=${input_server_ip:-$server_ip}
 fi
 
 # 获取端口号
@@ -109,7 +137,10 @@ fi
 echo_info "开始安装 Shadowsocks (libsodium)..."
 
 # 更新软件包列表并安装依赖
-apt update -y
+if ! apt update -y; then
+    echo_error "apt update 失败，请检查网络连接和 APT 源配置。"
+    exit 1
+fi
 if ! command -v curl &> /dev/null || ! command -v sudo &> /dev/null || ! command -v jq &> /dev/null || ! command -v qrencode &> /dev/null; then
     echo_info "正在安装必要的工具: curl, sudo, jq, qrencode..."
     apt install -y curl sudo jq qrencode
@@ -265,10 +296,16 @@ handle_firewalld() {
     case $fw_choice in
         1)
             echo_info "正在为所有 IP 开放端口 $server_port (TCP/UDP) ..."
-            if ensure_firewalld_port public "$server_port/tcp" \
-                && ensure_firewalld_port public "$server_port/udp" \
+            local default_zone
+            default_zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+            if [ -z "$default_zone" ]; then
+                echo_error "无法获取 firewalld 默认 zone。"
+                break
+            fi
+            if ensure_firewalld_port "$default_zone" "$server_port/tcp" \
+                && ensure_firewalld_port "$default_zone" "$server_port/udp" \
                 && firewall-cmd --reload; then
-                echo_success "firewalld: 端口 $server_port (TCP/UDP) 已为所有 IP 开放。"
+                echo_success "firewalld: 端口 $server_port (TCP/UDP) 已在默认 zone (${default_zone}) 开放。"
                 firewall_action_taken=true
             else
                 echo_error "firewalld 规则应用失败，请手动检查 firewalld 状态和规则。"
@@ -320,6 +357,7 @@ fi
 # 生成 ss:// 链接
 ss_link_plain="ss://${encrypt_method}:${ss_password}@${server_ip}:${server_port}"
 ss_link_base64="ss://$(echo -n "${encrypt_method}:${ss_password}@${server_ip}:${server_port}" | base64 -w 0)"
+clash_password_json=$(jq -Rn --arg v "$ss_password" '$v')
 
 # 输出必要信息
 echo ""
@@ -357,7 +395,7 @@ echo "    - name: \"SS-$(hostname)-${server_port}\" # 您可以自定义名称"
 echo "      type: ss"
 echo "      server: ${server_ip}"
 echo "      port: ${server_port}"
-echo "      password: \"${ss_password}\""
+echo "      password: ${clash_password_json}"
 echo "      cipher: ${encrypt_method}"
 echo "      udp: true # 根据您的 Shadowsocks 服务端配置调整，这里默认开启 UDP"
 # 如果需要，可以添加更多 Clash 支持的 Shadowsocks 参数，例如：
