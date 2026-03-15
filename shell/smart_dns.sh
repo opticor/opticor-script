@@ -817,6 +817,7 @@ max-reply-ip-num 1
 # 明文 DNS
 server 1.1.1.1
 server 8.8.8.8
+server 9.9.9.9
 server 223.5.5.5
 
 # DNS over HTTPS
@@ -1042,6 +1043,7 @@ nameserver 127.0.0.1
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 nameserver 8.8.8.8
+nameserver 9.9.9.9
 nameserver 223.5.5.5
 EOF
     print_msg "/etc/resolv.conf 已更新"
@@ -1094,6 +1096,7 @@ nameserver 127.0.0.1
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 nameserver 8.8.8.8
+nameserver 9.9.9.9
 nameserver 223.5.5.5
 EOF
 
@@ -1260,13 +1263,34 @@ test_dns() {
     for domain in "${test_domains[@]}"; do
         echo -e "${BLUE}[测试]${NC} $domain"
 
-        local result
-        if command -v nslookup &>/dev/null; then
-            result=$(nslookup "$domain" "127.0.0.1" -port="$port" 2>/dev/null | grep -A1 'Name:' | tail -1 || true)
-        elif command -v dig &>/dev/null; then
-            result=$(dig @127.0.0.1 -p "$port" "$domain" +short 2>/dev/null | head -3 || true)
+        local result=""
+        local query_output=""
+        if command -v dig &>/dev/null; then
+            result=$(dig @127.0.0.1 -p "$port" "$domain" +short 2>/dev/null \
+                | grep -E '^[0-9A-Fa-f:.]+$' | head -3 || true)
+        elif command -v nslookup &>/dev/null; then
+            if [[ "$port" == "53" ]]; then
+                query_output=$(nslookup "$domain" 127.0.0.1 2>/dev/null || true)
+            else
+                query_output=$(nslookup -port="$port" "$domain" 127.0.0.1 2>/dev/null || true)
+            fi
+
+            result=$(printf '%s\n' "$query_output" | awk '
+                BEGIN { IGNORECASE=1 }
+                /^Address([0-9]+)?:[[:space:]]*/ {
+                    sub(/^Address([0-9]+)?:[[:space:]]*/, "", $0)
+                    sub(/#.*$/, "", $0)
+                    if ($0 != "127.0.0.1" && $0 != "::1" && $0 != "") print
+                }
+                /^Addresses:[[:space:]]*/ {
+                    sub(/^Addresses:[[:space:]]*/, "", $0)
+                    gsub(/,/, "\n", $0)
+                    print
+                }
+            ' | awk 'NF' | head -3 || true)
         elif command -v host &>/dev/null; then
-            result=$(host "$domain" "127.0.0.1" 2>/dev/null | grep 'has address' | head -3 || true)
+            result=$(host "$domain" 127.0.0.1 2>/dev/null \
+                | awk '/has address/ {print $NF} /has IPv6 address/ {print $NF}' | head -3 || true)
         fi
 
         if [[ -n "$result" ]]; then
