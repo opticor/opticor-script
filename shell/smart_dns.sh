@@ -76,10 +76,13 @@ BANNER
 # 检查 root 权限
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        print_error "此脚本需要 root 权限运行"
-        print_info "请使用: sudo $0"
-        exit 1
+        local action="${1:-此操作}"
+        print_error "${action}需要 root 权限运行"
+        print_info "请使用 sudo 重新运行脚本，或切换到 root 后重试"
+        return 1
     fi
+
+    return 0
 }
 
 # 检查 systemd 是否可用 (命令存在且当前系统由 systemd 管理)
@@ -90,6 +93,260 @@ has_systemd() {
 # 确保配置目录存在
 ensure_config_dir() {
     mkdir -p "$SMARTDNS_CONF_DIR"
+}
+
+is_interactive() {
+    [[ -t 0 && -t 1 ]]
+}
+
+pause_screen() {
+    if ! is_interactive; then
+        return 0
+    fi
+
+    echo ""
+    read -rp "按回车键继续..." _pause_input
+}
+
+prompt_confirm() {
+    local prompt="$1"
+    local default="${2:-N}"
+    local hint input normalized
+
+    if [[ "${default^^}" == "Y" ]]; then
+        hint="[Y/n]"
+    else
+        hint="[y/N]"
+    fi
+
+    while true; do
+        if is_interactive; then
+            read -rp "${prompt} ${hint}: " input
+            input="${input:-$default}"
+        else
+            input="$default"
+        fi
+
+        normalized="${input,,}"
+        case "$normalized" in
+            y|yes)
+                return 0
+                ;;
+            n|no)
+                return 1
+                ;;
+            *)
+                print_warn "请输入 y 或 n"
+                ;;
+        esac
+    done
+}
+
+prompt_menu_choice() {
+    local __resultvar="$1"
+    local prompt="$2"
+    local valid_regex="$3"
+    local default="${4:-}"
+    local input prompt_text="$prompt"
+
+    if [[ -n "$default" ]]; then
+        prompt_text="${prompt} [默认: ${default}]"
+    fi
+
+    while true; do
+        if is_interactive; then
+            read -rp "${prompt_text}: " input
+            if [[ -n "$default" && -z "$input" ]]; then
+                input="$default"
+            fi
+        elif [[ -n "$default" ]]; then
+            input="$default"
+        else
+            print_error "当前为非交互环境，无法继续等待输入"
+            return 1
+        fi
+
+        if [[ "$input" =~ $valid_regex ]]; then
+            printf -v "$__resultvar" '%s' "$input"
+            return 0
+        fi
+
+        print_warn "输入无效，请重新输入"
+    done
+}
+
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+}
+
+is_valid_ipv4() {
+    local ip="$1"
+    local IFS=.
+    local octets
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r -a octets <<< "$ip"
+
+    for octet in "${octets[@]}"; do
+        [[ "$octet" -le 255 ]] || return 1
+    done
+
+    return 0
+}
+
+is_valid_domain() {
+    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+
+is_valid_group_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+ensure_main_config_exists() {
+    if [[ -f "$SMARTDNS_CONF" ]]; then
+        return 0
+    fi
+
+    print_warn "未找到主配置文件: $SMARTDNS_CONF"
+    print_info "请先执行快速安装，或在“高级配置 -> 重置为默认配置”中生成模板"
+    return 1
+}
+
+open_text_editor() {
+    local target_file="$1"
+    local editor_cmd=""
+
+    if [[ -n "${EDITOR:-}" ]]; then
+        editor_cmd="${EDITOR%% *}"
+        if command -v "$editor_cmd" &>/dev/null; then
+            "$editor_cmd" "$target_file"
+            return $?
+        fi
+    fi
+
+    for editor_cmd in nano vim vi; do
+        if command -v "$editor_cmd" &>/dev/null; then
+            "$editor_cmd" "$target_file"
+            return $?
+        fi
+    done
+
+    print_error "没有找到可用的文本编辑器"
+    print_info "请安装 nano/vim，或设置 EDITOR 环境变量"
+    return 1
+}
+
+get_config_template_name() {
+    case "$1" in
+        basic)
+            echo "基础配置"
+            ;;
+        china)
+            echo "国内优化配置"
+            ;;
+        simple|default)
+            echo "默认配置（无分组）"
+            ;;
+        *)
+            echo "当前配置"
+            ;;
+    esac
+}
+
+show_config_summary() {
+    local template_name="${1:-当前配置}"
+    local listen_port upstream_count doh_count dot_count
+
+    ensure_main_config_exists || return 1
+
+    listen_port=$(grep -E '^bind' "$SMARTDNS_CONF" 2>/dev/null | head -1 | grep -oE '[0-9]+$' || true)
+    listen_port="${listen_port:-53}"
+    upstream_count=$(grep -cE '^[[:space:]]*server([[:space:]]|-(https|tls)($|[[:space:]]))' "$SMARTDNS_CONF" 2>/dev/null || true)
+    upstream_count="${upstream_count:-0}"
+    doh_count=$(grep -cE '^[[:space:]]*server-https[[:space:]]+' "$SMARTDNS_CONF" 2>/dev/null || true)
+    doh_count="${doh_count:-0}"
+    dot_count=$(grep -cE '^[[:space:]]*server-tls[[:space:]]+' "$SMARTDNS_CONF" 2>/dev/null || true)
+    dot_count="${dot_count:-0}"
+
+    echo ""
+    echo -e "${CYAN}=========== 配置摘要 ===========${NC}"
+    echo "  模板: ${template_name}"
+    echo "  配置文件: ${SMARTDNS_CONF}"
+    echo "  监听端口: ${listen_port}"
+    echo "  上游 DNS: ${upstream_count} 个"
+    echo "  加密 DNS: DOH ${doh_count} 个 / DOT ${dot_count} 个"
+    echo -e "${CYAN}================================${NC}"
+}
+
+select_config_template() {
+    local __resultvar="$1"
+    local prompt="${2:-请选择配置模板}"
+    local default_choice="${3:-3}"
+    local template_choice
+
+    echo ""
+    echo "  1) 基础配置         双组分流模板，适合需要手动分流"
+    echo "  2) 国内优化配置     内置常见海外域名分流"
+    echo "  3) 默认配置(无分组) 最简默认模板，适合快速安装"
+
+    prompt_menu_choice template_choice "$prompt" '^[1-3]$' "$default_choice" || return 1
+
+    case "$template_choice" in
+        1)
+            printf -v "$__resultvar" '%s' "basic"
+            ;;
+        2)
+            printf -v "$__resultvar" '%s' "china"
+            ;;
+        3)
+            printf -v "$__resultvar" '%s' "simple"
+            ;;
+    esac
+}
+
+apply_config_template() {
+    local template_key="${1:-simple}"
+    local template_name
+    template_name=$(get_config_template_name "$template_key")
+
+    case "$template_key" in
+        basic)
+            generate_basic_config
+            ;;
+        china)
+            generate_china_optimized_config
+            ;;
+        simple|default)
+            generate_simple_config
+            ;;
+        *)
+            print_error "未知配置模板: ${template_key}"
+            return 1
+            ;;
+    esac
+
+    print_info "已应用模板: ${template_name}"
+    show_config_summary "$template_name"
+}
+
+run_menu_action() {
+    local action_name="$1"
+    local permission="${2:-readonly}"
+    shift 2
+
+    echo ""
+    echo -e "${CYAN}>>> ${action_name}${NC}"
+
+    if [[ "$permission" == "root" ]] && ! check_root "$action_name"; then
+        pause_screen
+        return 1
+    fi
+
+    if ! "$@"; then
+        print_warn "${action_name}未完全执行，请查看上方提示"
+    fi
+
+    pause_screen
 }
 
 # 安全更新 crontab：删除匹配项并可选追加一条任务
@@ -213,8 +470,10 @@ check_network() {
 
     if ! $connected; then
         print_warn "网络连接可能存在问题，安装过程可能会失败"
-        read -rp "是否继续? [y/N]: " choice
-        [[ "${choice,,}" != "y" ]] && exit 1
+        if ! prompt_confirm "是否继续安装流程?" "N"; then
+            print_info "已取消当前流程"
+            return 1
+        fi
     else
         print_msg "网络连接正常"
     fi
@@ -842,6 +1101,8 @@ EOF
 generate_adblock_config() {
     print_info "生成广告过滤规则..."
 
+    ensure_main_config_exists || return 1
+
     local adblock_conf="${SMARTDNS_CONF_DIR}/anti-ad.conf"
     ensure_config_dir
 
@@ -891,6 +1152,8 @@ EOF
 
 # 生成自定义 hosts
 create_custom_hosts() {
+    ensure_main_config_exists || return 1
+
     local custom_conf="${SMARTDNS_CONF_DIR}/custom-hosts.conf"
     ensure_config_dir
 
@@ -971,6 +1234,7 @@ check_port_conflict() {
 # 处理端口冲突
 resolve_port_conflict() {
     local port="${1:-53}"
+    local choice custom_port
 
     if ! check_port_conflict "$port"; then
         echo ""
@@ -981,7 +1245,8 @@ resolve_port_conflict() {
         echo "  4) 自定义端口"
         echo "  5) 跳过 (手动处理)"
         echo ""
-        read -rp "请选择 [1-5]: " choice
+
+        prompt_menu_choice choice "请选择处理方式 [1-5]" '^[1-5]$' "1" || return 1
 
         case "$choice" in
             1)
@@ -994,20 +1259,23 @@ resolve_port_conflict() {
                 change_listen_port 6053
                 ;;
             4)
-                read -rp "请输入自定义端口号 (1024-65535): " custom_port
-                if [[ "$custom_port" =~ ^[0-9]+$ ]] && [[ "$custom_port" -ge 1024 ]] && [[ "$custom_port" -le 65535 ]]; then
-                    change_listen_port "$custom_port"
-                else
-                    print_error "无效的端口号"
-                    return 1
-                fi
+                while true; do
+                    if is_interactive; then
+                        read -rp "请输入自定义端口号 (1024-65535): " custom_port
+                    else
+                        custom_port="5353"
+                    fi
+
+                    if [[ "$custom_port" =~ ^[0-9]+$ ]] && [[ "$custom_port" -ge 1024 ]] && [[ "$custom_port" -le 65535 ]]; then
+                        change_listen_port "$custom_port"
+                        break
+                    fi
+
+                    print_warn "端口号必须在 1024-65535 之间"
+                done
                 ;;
             5)
-                print_warn "跳过端口冲突处理，请手动配置"
-                ;;
-            *)
-                print_error "无效选择"
-                return 1
+                print_warn "已跳过端口冲突处理，请稍后手动处理监听端口或系统 DNS"
                 ;;
         esac
     fi
@@ -1068,23 +1336,21 @@ change_listen_port() {
 set_system_dns() {
     print_info "设置系统 DNS 为 SmartDNS..."
 
+    ensure_main_config_exists || return 1
+
     local dns_port
     dns_port=$(grep -E '^bind' "$SMARTDNS_CONF" 2>/dev/null | head -1 | grep -oE '[0-9]+$')
     dns_port="${dns_port:-53}"
 
     if [[ "$dns_port" == "53" ]]; then
-        # 直接设置 resolv.conf
-        # 备份原文件
         if [[ -f /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
             cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)
         fi
 
-        # 若文件被 immutable，先解锁避免 set -e 退出
         if command -v chattr &>/dev/null; then
             chattr -i /etc/resolv.conf 2>/dev/null || true
         fi
 
-        # 如果是软链接 (systemd-resolved)
         if [[ -L /etc/resolv.conf ]]; then
             rm -f /etc/resolv.conf
         fi
@@ -1100,17 +1366,18 @@ nameserver 9.9.9.9
 nameserver 223.5.5.5
 EOF
 
-        # 防止 resolv.conf 被覆盖
         if command -v chattr &>/dev/null; then
             chattr +i /etc/resolv.conf 2>/dev/null || true
         fi
 
         print_msg "系统 DNS 已设置为 127.0.0.1"
+        print_info "如后续网络解析异常，可先恢复 /etc/resolv.conf 备份后再排查"
     else
         print_warn "SmartDNS 未监听 53 端口 (当前: ${dns_port})"
-        print_info "请手动配置系统 DNS 或使用 iptables 转发"
-        print_info "  方法1: 在需要的客户端设置 DNS 为 服务器IP:${dns_port}"
+        print_info "请手动配置系统 DNS 或使用端口转发"
+        print_info "  方法1: 在客户端设置 DNS 为 服务器IP:${dns_port}"
         print_info "  方法2: iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port ${dns_port}"
+        return 1
     fi
 }
 
@@ -1452,8 +1719,9 @@ update_smartdns() {
 
     if [[ "$current_version" == "$SMARTDNS_VERSION" ]] || [[ "$current_version" == *"${SMARTDNS_VERSION##Release}"* ]]; then
         print_msg "当前已是最新版本: $current_version"
-        read -rp "是否强制重新安装? [y/N]: " force
-        [[ "${force,,}" != "y" ]] && return 0
+        if ! prompt_confirm "是否强制重新安装?" "N"; then
+            return 0
+        fi
     else
         print_info "当前版本: $current_version"
         print_info "最新版本: $SMARTDNS_VERSION"
@@ -1515,11 +1783,10 @@ uninstall_smartdns() {
     echo ""
     echo -e "${RED}${BOLD}警告: 即将卸载 SmartDNS${NC}"
     echo ""
-    read -rp "确认卸载? (输入 'yes' 确认): " confirm
 
-    if [[ "$confirm" != "yes" ]]; then
+    if ! prompt_confirm "确认卸载 SmartDNS?" "N"; then
         print_info "取消卸载"
-        return
+        return 0
     fi
 
     print_info "开始卸载 SmartDNS..."
@@ -1544,8 +1811,7 @@ uninstall_smartdns() {
     fi
 
     # 询问是否删除配置
-    read -rp "是否删除配置文件? [y/N]: " del_conf
-    if [[ "${del_conf,,}" == "y" ]]; then
+    if prompt_confirm "是否删除配置文件?" "N"; then
         rm -rf "$SMARTDNS_CONF_DIR"
         print_msg "配置文件已删除"
     else
@@ -1564,97 +1830,138 @@ uninstall_smartdns() {
     fi
 
     # 恢复 systemd-resolved
-    read -rp "是否恢复 systemd-resolved? [y/N]: " restore_resolved
-    if [[ "${restore_resolved,,}" == "y" ]]; then
+    if prompt_confirm "是否恢复 systemd-resolved?" "N"; then
         if has_systemd && systemctl list-unit-files | grep -q systemd-resolved; then
             systemctl enable systemd-resolved
             systemctl start systemd-resolved
             ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
             print_msg "systemd-resolved 已恢复"
+        else
+            print_warn "当前系统未检测到 systemd-resolved 单元"
         fi
     fi
 
     print_msg "SmartDNS 已成功卸载"
 }
 
+edit_main_config() {
+    if ! ensure_main_config_exists; then
+        if ! prompt_confirm "配置文件不存在，是否现在生成配置模板?" "Y"; then
+            return 0
+        fi
+
+        local template_key
+        select_config_template template_key "请选择要生成的配置模板" "3" || return 1
+        apply_config_template "$template_key" || return 1
+    fi
+
+    open_text_editor "$SMARTDNS_CONF"
+}
+
+manage_custom_hosts() {
+    create_custom_hosts || return 1
+    open_text_editor "${SMARTDNS_CONF_DIR}/custom-hosts.conf"
+}
+
+interactive_change_listen_port() {
+    ensure_main_config_exists || return 1
+
+    local new_port
+    while true; do
+        if is_interactive; then
+            read -rp "请输入新的监听端口 (1-65535): " new_port
+        else
+            new_port="5353"
+        fi
+
+        if is_valid_port "$new_port"; then
+            change_listen_port "$new_port"
+            show_config_summary "当前配置"
+            return 0
+        fi
+
+        print_warn "监听端口必须是 1-65535 之间的数字"
+    done
+}
+
+reset_config_template() {
+    local template_key
+    select_config_template template_key "请选择要重置的配置模板" "3" || return 1
+    apply_config_template "$template_key"
+}
+
+menu_update_smartdns() {
+    detect_os
+    detect_arch
+    update_smartdns
+}
+
+menu_uninstall_smartdns() {
+    detect_os
+    uninstall_smartdns
+}
+
 # ======================== 高级配置菜单 ========================
 
 advanced_config_menu() {
+    local adv_choice
+
     while true; do
         echo ""
         echo -e "${CYAN}============ 高级配置 ============${NC}"
-        echo "  1) 编辑主配置文件"
-        echo "  2) 添加上游 DNS 服务器"
-        echo "  3) 添加域名分流规则"
-        echo "  4) 配置广告过滤"
-        echo "  5) 配置自定义 hosts"
-        echo "  6) 修改监听端口"
-        echo "  7) 开启/关闭 DOH/DOT"
-        echo "  8) 配置日志"
-        echo "  9) 重置为默认配置"
-        echo "  10) 查看上游 DNS 配置"
+        if [[ $EUID -ne 0 ]]; then
+            echo -e "  ${YELLOW}当前为只读模式，修改类操作需要 root 权限${NC}"
+            echo ""
+        fi
+        echo "  1) 编辑主配置文件       创建模板后再进入编辑器"
+        echo "  2) 添加上游 DNS         追加 server/server-https/server-tls"
+        echo "  3) 添加域名分流规则     追加 nameserver 规则"
+        echo "  4) 配置广告过滤         下载并引用 anti-ad 规则"
+        echo "  5) 配置自定义 hosts     创建并编辑 custom-hosts.conf"
+        echo "  6) 修改监听端口         校验后写入 bind 配置"
+        echo "  7) 开启/关闭 DOH/DOT    批量切换加密 DNS"
+        echo "  8) 配置日志             设置日志级别和审计日志"
+        echo "  9) 重置为默认配置       重新选择配置模板"
+        echo "  10) 查看上游 DNS 配置   只读查看当前 server 列表"
         echo "  0) 返回主菜单"
         echo -e "${CYAN}==================================${NC}"
         echo ""
-        read -rp "请选择 [0-10]: " adv_choice
+
+        prompt_menu_choice adv_choice "请选择 [0-10]" '^(0|[1-9]|10)$' || return 1
 
         case "$adv_choice" in
             1)
-                if command -v nano &>/dev/null; then
-                    nano "$SMARTDNS_CONF"
-                elif command -v vi &>/dev/null; then
-                    vi "$SMARTDNS_CONF"
-                else
-                    print_error "没有找到文本编辑器"
-                fi
+                run_menu_action "编辑主配置文件" root edit_main_config
                 ;;
             2)
-                add_upstream_dns
+                run_menu_action "添加上游 DNS 服务器" root add_upstream_dns
                 ;;
             3)
-                add_domain_rules
+                run_menu_action "添加域名分流规则" root add_domain_rules
                 ;;
             4)
-                generate_adblock_config
+                run_menu_action "配置广告过滤" root generate_adblock_config
                 ;;
             5)
-                create_custom_hosts
-                if command -v nano &>/dev/null; then
-                    nano "${SMARTDNS_CONF_DIR}/custom-hosts.conf"
-                fi
+                run_menu_action "配置自定义 hosts" root manage_custom_hosts
                 ;;
             6)
-                read -rp "请输入新的监听端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]]; then
-                    change_listen_port "$new_port"
-                fi
+                run_menu_action "修改监听端口" root interactive_change_listen_port
                 ;;
             7)
-                toggle_encrypted_dns
+                run_menu_action "切换加密 DNS" root toggle_encrypted_dns
                 ;;
             8)
-                configure_logging
+                run_menu_action "配置日志" root configure_logging
                 ;;
             9)
-                echo "请选择配置模板:"
-                echo "  1) 基础配置"
-                echo "  2) 国内优化配置"
-                echo "  3) 默认配置 (无分组)"
-                read -rp "选择 [1-3]: " template
-                case "$template" in
-                    1) generate_basic_config ;;
-                    2) generate_china_optimized_config ;;
-                    3) generate_simple_config ;;
-                esac
+                run_menu_action "重置配置模板" root reset_config_template
                 ;;
             10)
-                view_upstream_dns
+                run_menu_action "查看上游 DNS 配置" readonly view_upstream_dns
                 ;;
             0)
                 return
-                ;;
-            *)
-                print_error "无效选择"
                 ;;
         esac
     done
@@ -1662,42 +1969,64 @@ advanced_config_menu() {
 
 # 添加上游 DNS
 add_upstream_dns() {
+    ensure_main_config_exists || return 1
+
     echo ""
     echo -e "${CYAN}添加上游 DNS 服务器${NC}"
     echo "  格式说明:"
     echo "  - 普通 DNS:  IP地址 (如: 1.1.1.1)"
     echo "  - DOH:       https://域名/dns-query"
     echo "  - DOT:       域名 (如: dns.google)"
+    echo "  - 留空回车:  取消当前操作"
     echo ""
 
-    read -rp "DNS 服务器地址: " dns_addr
-    [[ -z "$dns_addr" ]] && return
+    local dns_addr group_name dns_line=""
 
-    read -rp "分组名 (留空为默认组): " group_name
-    read -rp "是否从默认组排除? [y/N]: " exclude
+    while true; do
+        if is_interactive; then
+            read -rp "DNS 服务器地址: " dns_addr
+        else
+            print_error "非交互模式下无法手动添加上游 DNS"
+            return 1
+        fi
 
-    local dns_line=""
+        [[ -z "$dns_addr" ]] && return 0
 
-    # 判断 DNS 类型
-    if [[ "$dns_addr" == https://* ]]; then
-        dns_line="server-https ${dns_addr}"
-    elif [[ "$dns_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        dns_line="server ${dns_addr}"
-    else
-        # 假设是 DOT
-        dns_line="server-tls ${dns_addr}"
-    fi
+        if [[ "$dns_addr" == https://* ]]; then
+            if [[ "$dns_addr" =~ ^https://[^[:space:]]+/dns-query([?][^[:space:]]*)?$ ]]; then
+                dns_line="server-https ${dns_addr}"
+                break
+            fi
+            print_warn "DOH 地址格式应类似 https://dns.google/dns-query"
+        elif is_valid_ipv4 "$dns_addr"; then
+            dns_line="server ${dns_addr}"
+            break
+        elif is_valid_domain "$dns_addr"; then
+            dns_line="server-tls ${dns_addr}"
+            break
+        else
+            print_warn "仅支持 IPv4、DOH 地址或域名形式的 DOT 服务器"
+        fi
+    done
 
-    # 添加分组
+    while true; do
+        read -rp "分组名 (留空为默认组): " group_name
+        if [[ -z "$group_name" ]] || is_valid_group_name "$group_name"; then
+            break
+        fi
+        print_warn "分组名仅允许字母、数字、点、下划线和连字符"
+    done
+
     if [[ -n "$group_name" ]]; then
         dns_line="${dns_line} -group ${group_name}"
-        if [[ "${exclude,,}" == "y" ]]; then
+        if prompt_confirm "是否从默认组排除?" "N"; then
             dns_line="${dns_line} -exclude-default-group"
         fi
     fi
 
     echo "$dns_line" >> "$SMARTDNS_CONF"
     print_msg "已添加: $dns_line"
+    show_config_summary "当前配置"
 }
 
 # 查看当前上游 DNS 配置
@@ -1754,15 +2083,38 @@ view_upstream_dns() {
 
 # 添加域名分流规则
 add_domain_rules() {
+    ensure_main_config_exists || return 1
+
     echo ""
     echo -e "${CYAN}添加域名分流规则${NC}"
     echo ""
 
-    read -rp "域名 (如: google.com): " domain
-    [[ -z "$domain" ]] && return
+    local domain group_name
 
-    read -rp "DNS 分组名: " group_name
-    [[ -z "$group_name" ]] && return
+    while true; do
+        if is_interactive; then
+            read -rp "域名 (如: google.com，留空取消): " domain
+        else
+            print_error "非交互模式下无法手动添加域名规则"
+            return 1
+        fi
+
+        [[ -z "$domain" ]] && return 0
+
+        if is_valid_domain "$domain"; then
+            break
+        fi
+
+        print_warn "域名格式无效，请重新输入"
+    done
+
+    while true; do
+        read -rp "DNS 分组名: " group_name
+        if [[ -n "$group_name" ]] && is_valid_group_name "$group_name"; then
+            break
+        fi
+        print_warn "分组名不能为空，且只能包含字母、数字、点、下划线和连字符"
+    done
 
     echo "nameserver /${domain}/${group_name}" >> "$SMARTDNS_CONF"
     print_msg "已添加规则: ${domain} -> ${group_name}"
@@ -1770,9 +2122,11 @@ add_domain_rules() {
 
 # 切换加密 DNS
 toggle_encrypted_dns() {
+    ensure_main_config_exists || return 1
+
     echo ""
     echo "当前加密 DNS 状态:"
-    local doh_count dot_count
+    local doh_count dot_count enc_choice
     doh_count=$(grep -c '^server-https' "$SMARTDNS_CONF" 2>/dev/null || true)
     doh_count="${doh_count:-0}"
     dot_count=$(grep -c '^server-tls' "$SMARTDNS_CONF" 2>/dev/null || true)
@@ -1783,7 +2137,8 @@ toggle_encrypted_dns() {
     echo "  1) 启用所有加密 DNS"
     echo "  2) 禁用所有加密 DNS"
     echo "  3) 返回"
-    read -rp "选择 [1-3]: " enc_choice
+
+    prompt_menu_choice enc_choice "选择 [1-3]" '^[1-3]$' "3" || return 1
 
     case "$enc_choice" in
         1)
@@ -1796,11 +2151,16 @@ toggle_encrypted_dns() {
             sed -i -E 's|^[[:space:]]*#?[[:space:]]*(server-tls[[:space:]].*)$|# \1|' "$SMARTDNS_CONF"
             print_msg "已禁用所有加密 DNS"
             ;;
+        3)
+            return 0
+            ;;
     esac
 }
 
 # 配置日志
 configure_logging() {
+    ensure_main_config_exists || return 1
+
     echo ""
     echo "日志级别选择:"
     echo "  1) debug  - 调试 (最详细)"
@@ -1809,9 +2169,10 @@ configure_logging() {
     echo "  4) warn   - 警告 (推荐)"
     echo "  5) error  - 错误"
     echo "  6) off    - 关闭"
-    read -rp "选择 [1-6]: " log_choice
 
-    local log_level
+    local log_choice log_level
+    prompt_menu_choice log_choice "选择 [1-6]" '^[1-6]$' "4" || return 1
+
     case "$log_choice" in
         1) log_level="debug" ;;
         2) log_level="info" ;;
@@ -1819,24 +2180,19 @@ configure_logging() {
         4) log_level="warn" ;;
         5) log_level="error" ;;
         6) log_level="off" ;;
-        *) log_level="warn" ;;
     esac
 
     sed -i "s/^log-level .*/log-level ${log_level}/" "$SMARTDNS_CONF"
 
-    # 确保日志目录存在
     mkdir -p /var/log/smartdns 2>/dev/null || true
 
-    # 启用日志文件
     if ! grep -q '^log-file' "$SMARTDNS_CONF"; then
         sed -i "/^log-level/a log-file /var/log/smartdns/smartdns.log" "$SMARTDNS_CONF"
         sed -i "/^log-file/a log-size 256k" "$SMARTDNS_CONF"
         sed -i "/^log-size/a log-num 5" "$SMARTDNS_CONF"
     fi
 
-    # 询问是否开启审计日志
-    read -rp "是否开启审计日志 (记录所有DNS查询)? [y/N]: " audit
-    if [[ "${audit,,}" == "y" ]]; then
+    if prompt_confirm "是否开启审计日志 (记录所有 DNS 查询)?" "N"; then
         if grep -q '^# *audit-enable' "$SMARTDNS_CONF"; then
             sed -i 's/^# *audit-enable.*/audit-enable yes/' "$SMARTDNS_CONF"
             sed -i 's/^# *audit-file.*/audit-file \/var\/log\/smartdns\/smartdns-audit.log/' "$SMARTDNS_CONF"
@@ -1866,6 +2222,8 @@ setup_cron_jobs() {
         return 1
     fi
 
+    local cron_choice
+
     echo ""
     echo -e "${CYAN}============ 定时任务设置 ============${NC}"
     echo "  1) 设置广告规则自动更新 (每天凌晨3点)"
@@ -1876,7 +2234,8 @@ setup_cron_jobs() {
     echo "  0) 返回"
     echo -e "${CYAN}======================================${NC}"
     echo ""
-    read -rp "请选择 [0-5]: " cron_choice
+
+    prompt_menu_choice cron_choice "请选择 [0-5]" '^[0-5]$' "0" || return 1
 
     case "$cron_choice" in
         1)
@@ -1913,6 +2272,8 @@ setup_cron_jobs() {
 # ======================== 查看日志 ========================
 
 view_logs() {
+    local log_view_choice
+
     echo ""
     echo -e "${CYAN}============ 日志查看 ============${NC}"
     echo "  1) 查看 SmartDNS 运行日志 (最近50行)"
@@ -1924,7 +2285,8 @@ view_logs() {
     echo "  0) 返回"
     echo -e "${CYAN}==================================${NC}"
     echo ""
-    read -rp "请选择 [0-6]: " log_view_choice
+
+    prompt_menu_choice log_view_choice "请选择 [0-6]" '^[0-6]$' "0" || return 1
 
     case "$log_view_choice" in
         1)
@@ -1942,7 +2304,11 @@ view_logs() {
             fi
             ;;
         3)
-            journalctl -u smartdns --no-pager -n 50 2>/dev/null || print_warn "无法查看 systemd 日志"
+            if command -v journalctl &>/dev/null && has_systemd; then
+                journalctl -u smartdns --no-pager -n 50 2>/dev/null || print_warn "无法查看 systemd 日志"
+            else
+                print_warn "当前系统未提供可用的 journalctl/systemd 日志"
+            fi
             ;;
         4)
             if [[ -f /var/log/smartdns/smartdns.log ]]; then
@@ -1961,8 +2327,12 @@ view_logs() {
             fi
             ;;
         6)
-            print_info "按 Ctrl+C 退出..."
-            journalctl -u smartdns -f 2>/dev/null || print_warn "无法查看 systemd 日志"
+            if command -v journalctl &>/dev/null && has_systemd; then
+                print_info "按 Ctrl+C 退出..."
+                journalctl -u smartdns -f 2>/dev/null || print_warn "无法查看 systemd 日志"
+            else
+                print_warn "当前系统未提供可用的 journalctl/systemd 日志"
+            fi
             ;;
         0)
             return
@@ -1976,19 +2346,26 @@ quick_install() {
     print_banner
     print_info "开始快速安装 SmartDNS..."
     echo ""
+    echo -e "${CYAN}本向导将依次执行:${NC}"
+    echo "  1) 检测系统、架构和网络"
+    echo "  2) 安装依赖并下载 SmartDNS"
+    echo "  3) 选择配置模板并写入配置"
+    echo "  4) 处理端口冲突、验证配置、启动服务"
+    echo "  5) 可选接管系统 DNS，并进行解析测试"
+    echo ""
 
-    # 检测环境
+    if ! prompt_confirm "是否继续快速安装?" "Y"; then
+        print_info "已取消快速安装"
+        return 0
+    fi
+
     detect_os
     detect_arch
-    check_network
+    check_network || return 1
 
-    # 安装依赖
     install_dependencies
-
-    # 获取最新版本
     get_latest_version
 
-    # 根据系统类型选择安装方式
     case "$OS_TYPE" in
         debian)
             install_smartdns_deb
@@ -1998,61 +2375,47 @@ quick_install() {
             ;;
     esac
 
-    # 检查是否安装成功
     if ! command -v smartdns &>/dev/null; then
-        print_error "SmartDNS 安装失败！"
-        exit 1
+        print_error "SmartDNS 安装失败，请检查下载或安装日志"
+        return 1
     fi
 
-    # 快速安装默认使用“默认配置（无分组）”
-    print_info "应用默认配置模板（无分组）..."
-    generate_simple_config
+    local template_key template_name
+    select_config_template template_key "请选择安装后要应用的配置模板" "3" || return 1
+    template_name=$(get_config_template_name "$template_key")
+    apply_config_template "$template_key" || return 1
 
-    # 处理端口冲突
-    resolve_port_conflict 53
-
-    # 验证配置
-    validate_config
-
-    # 设置开机自启
+    resolve_port_conflict 53 || return 1
+    validate_config || return 1
     enable_autostart
+    start_smartdns || return 1
 
-    # 启动服务
-    start_smartdns
-
-    # 设置系统 DNS
-    echo ""
-    read -rp "是否将系统 DNS 设置为 SmartDNS? [Y/n]: " set_dns
-    set_dns="${set_dns:-Y}"
-    if [[ "${set_dns,,}" != "n" ]]; then
-        set_system_dns
+    if prompt_confirm "是否将系统 DNS 设置为 SmartDNS?" "Y"; then
+        set_system_dns || print_warn "系统 DNS 未完成接管，请根据上方提示手动处理"
     fi
 
-    # 测试
-    echo ""
-    read -rp "是否进行 DNS 解析测试? [Y/n]: " do_test
-    do_test="${do_test:-Y}"
-    if [[ "${do_test,,}" != "n" ]]; then
+    if prompt_confirm "是否进行 DNS 解析测试?" "Y"; then
         sleep 2
-        test_dns
+        test_dns || true
     fi
 
-    # 完成
     echo ""
     echo -e "${GREEN}${BOLD}========================================${NC}"
     echo -e "${GREEN}${BOLD}    SmartDNS 安装配置完成！${NC}"
     echo -e "${GREEN}${BOLD}========================================${NC}"
     echo ""
+    print_info "最终配置模板: ${template_name}"
     show_status
 }
 
 # ======================== 主菜单 ========================
 
 main_menu() {
+    local main_choice
+
     while true; do
         print_banner
 
-        # 简要状态显示
         if command -v smartdns &>/dev/null; then
             local status_color="${RED}"
             local status_text="未运行"
@@ -2064,118 +2427,101 @@ main_menu() {
         else
             echo -e "  SmartDNS: ${YELLOW}未安装${NC}"
         fi
+
+        if [[ $EUID -ne 0 ]]; then
+            echo -e "  ${YELLOW}当前为只读模式；安装、更新和写配置操作需要 root 权限${NC}"
+        fi
         echo ""
 
         echo -e "${CYAN}==================== 主菜单 ====================${NC}"
         echo ""
         echo -e "  ${BOLD}安装与更新${NC}"
-        echo "    1)  快速安装 SmartDNS"
-        echo "    2)  更新 SmartDNS"
-        echo "    3)  卸载 SmartDNS"
+        echo "    1)  快速安装 SmartDNS   安装、配置并启动基础服务"
+        echo "    2)  更新 SmartDNS       下载并重装最新版本"
+        echo "    3)  卸载 SmartDNS       停止服务并清理安装"
         echo ""
         echo -e "  ${BOLD}服务管理${NC}"
-        echo "    4)  启动 SmartDNS"
-        echo "    5)  停止 SmartDNS"
-        echo "    6)  重启 SmartDNS"
-        echo "    7)  查看运行状态"
+        echo "    4)  启动 SmartDNS       启动或恢复服务"
+        echo "    5)  停止 SmartDNS       停止当前服务"
+        echo "    6)  重启 SmartDNS       重新加载进程"
+        echo "    7)  查看运行状态        只读查看版本、端口和 DNS"
         echo ""
         echo -e "  ${BOLD}配置管理${NC}"
-        echo "    8)  高级配置"
-        echo "    9)  验证配置文件"
-        echo "    10) 设置系统 DNS"
+        echo "    8)  高级配置            编辑模板、规则和日志设置"
+        echo "    9)  验证配置文件        检查 bind 和上游 DNS"
+        echo "    10) 设置系统 DNS        接管 /etc/resolv.conf"
         echo ""
         echo -e "  ${BOLD}测试与诊断${NC}"
-        echo "    11) DNS 解析测试"
-        echo "    12) DNS 性能测试"
-        echo "    13) 查看日志"
+        echo "    11) DNS 解析测试        测试常见域名解析"
+        echo "    12) DNS 性能测试        比较首次和缓存响应时间"
+        echo "    13) 查看日志            查看运行、审计或 systemd 日志"
         echo ""
         echo -e "  ${BOLD}维护${NC}"
-        echo "    14) 更新广告过滤规则"
-        echo "    15) 定时任务设置"
-        echo "    16) 备份配置"
+        echo "    14) 更新广告过滤规则    下载最新 anti-ad 规则"
+        echo "    15) 定时任务设置        管理 SmartDNS 相关 crontab"
+        echo "    16) 备份配置            备份当前 smartdns.conf"
         echo ""
         echo "    0)  退出"
         echo ""
         echo -e "${CYAN}=================================================${NC}"
         echo ""
-        read -rp "请选择 [0-16]: " main_choice
+
+        prompt_menu_choice main_choice "请选择 [0-16]" '^(0|[1-9]|1[0-6])$' || return 1
 
         case "$main_choice" in
             1)
-                quick_install
-                read -rp "按回车键继续..."
+                run_menu_action "快速安装 SmartDNS" root quick_install
                 ;;
             2)
-                detect_os
-                detect_arch
-                update_smartdns
-                read -rp "按回车键继续..."
+                run_menu_action "更新 SmartDNS" root menu_update_smartdns
                 ;;
             3)
-                detect_os
-                uninstall_smartdns
-                read -rp "按回车键继续..."
+                run_menu_action "卸载 SmartDNS" root menu_uninstall_smartdns
                 ;;
             4)
-                start_smartdns
-                read -rp "按回车键继续..."
+                run_menu_action "启动 SmartDNS" root start_smartdns
                 ;;
             5)
-                stop_smartdns
-                read -rp "按回车键继续..."
+                run_menu_action "停止 SmartDNS" root stop_smartdns
                 ;;
             6)
-                restart_smartdns
-                read -rp "按回车键继续..."
+                run_menu_action "重启 SmartDNS" root restart_smartdns
                 ;;
             7)
-                show_status
-                read -rp "按回车键继续..."
+                run_menu_action "查看运行状态" readonly show_status
                 ;;
             8)
                 advanced_config_menu
                 ;;
             9)
-                validate_config
-                read -rp "按回车键继续..."
+                run_menu_action "验证配置文件" readonly validate_config
                 ;;
             10)
-                set_system_dns
-                read -rp "按回车键继续..."
+                run_menu_action "设置系统 DNS" root set_system_dns
                 ;;
             11)
-                test_dns
-                read -rp "按回车键继续..."
+                run_menu_action "DNS 解析测试" readonly test_dns
                 ;;
             12)
-                benchmark_dns
-                read -rp "按回车键继续..."
+                run_menu_action "DNS 性能测试" readonly benchmark_dns
                 ;;
             13)
-                view_logs
-                read -rp "按回车键继续..."
+                run_menu_action "查看日志" readonly view_logs
                 ;;
             14)
-                update_adblock_rules
-                read -rp "按回车键继续..."
+                run_menu_action "更新广告过滤规则" root update_adblock_rules
                 ;;
             15)
-                setup_cron_jobs
-                read -rp "按回车键继续..."
+                run_menu_action "定时任务设置" root setup_cron_jobs
                 ;;
             16)
-                backup_config
-                read -rp "按回车键继续..."
+                run_menu_action "备份配置" root backup_config
                 ;;
             0)
                 echo ""
                 print_msg "再见！"
                 echo ""
                 exit 0
-                ;;
-            *)
-                print_error "无效选择，请重试"
-                sleep 1
                 ;;
         esac
     done
@@ -2190,24 +2536,28 @@ show_help() {
     echo "用法: $0 [选项]"
     echo ""
     echo "选项:"
-    echo "  --install, -i       快速安装"
-    echo "  --uninstall, -u     卸载"
+    echo "  --install, -i       快速安装向导"
+    echo "  --uninstall, -u     卸载 SmartDNS"
     echo "  --update            更新 SmartDNS"
     echo "  --start             启动服务"
     echo "  --stop              停止服务"
     echo "  --restart           重启服务"
-    echo "  --status            查看状态"
-    echo "  --test              DNS 解析测试"
-    echo "  --benchmark         DNS 性能测试"
+    echo "  --status            查看状态 (非 root 可用)"
+    echo "  --test              DNS 解析测试 (非 root 可用)"
+    echo "  --benchmark         DNS 性能测试 (非 root 可用)"
     echo "  --config [type]     生成配置 (default/basic/china/simple)"
     echo "  --update-adblock    更新广告过滤规则"
-    echo "  --menu              进入交互菜单 (默认)"
+    echo "  --menu              进入交互菜单 (默认，非 root 可只读浏览)"
     echo "  --help, -h          显示帮助"
+    echo ""
+    echo "说明:"
+    echo "  - 只读操作可在非 root 模式下运行"
+    echo "  - 安装、更新、写配置、改 DNS、改服务等操作需要 root 权限"
     echo ""
     echo "示例:"
     echo "  $0 --install        # 快速安装"
-    echo "  $0 --config default # 生成默认配置(无分组)"
-    echo "  $0 --test           # 测试 DNS 解析"
+    echo "  $0 --config china   # 生成国内优化配置"
+    echo "  $0 --status         # 查看当前状态"
     echo "  $0                  # 进入交互菜单"
     echo ""
 }
@@ -2215,36 +2565,37 @@ show_help() {
 # ======================== 入口 ========================
 
 main() {
-    # 初始化日志
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
     touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
 
-    # 检查 root
-    check_root
-
-    # 处理命令行参数
     case "${1:-}" in
         --install|-i)
+            check_root "快速安装 SmartDNS" || exit 1
             detect_os
             detect_arch
             quick_install
             ;;
         --uninstall|-u)
+            check_root "卸载 SmartDNS" || exit 1
             detect_os
             uninstall_smartdns
             ;;
         --update)
+            check_root "更新 SmartDNS" || exit 1
             detect_os
             detect_arch
             update_smartdns
             ;;
         --start)
+            check_root "启动 SmartDNS" || exit 1
             start_smartdns
             ;;
         --stop)
+            check_root "停止 SmartDNS" || exit 1
             stop_smartdns
             ;;
         --restart)
+            check_root "重启 SmartDNS" || exit 1
             restart_smartdns
             ;;
         --status)
@@ -2257,14 +2608,25 @@ main() {
             benchmark_dns
             ;;
         --config)
+            check_root "生成 SmartDNS 配置" || exit 1
             case "${2:-default}" in
-                default|simple) generate_simple_config ;;
-                china) generate_china_optimized_config ;;
-                basic) generate_basic_config ;;
-                *) generate_simple_config ;;
+                default|simple)
+                    apply_config_template simple
+                    ;;
+                china)
+                    apply_config_template china
+                    ;;
+                basic)
+                    apply_config_template basic
+                    ;;
+                *)
+                    print_warn "未知配置模板: ${2:-default}，将使用默认配置（无分组）"
+                    apply_config_template simple
+                    ;;
             esac
             ;;
         --update-adblock)
+            check_root "更新广告过滤规则" || exit 1
             update_adblock_rules
             ;;
         --help|-h)
@@ -2285,3 +2647,7 @@ main() {
 
 # 运行
 main "$@"
+
+
+
+
